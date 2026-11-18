@@ -22,6 +22,13 @@ pub fn test_transport(ctx: &CmdCtx) -> CommandResult {
 
     if devices.is_empty() {
         println!("No devices found!");
+        if let Some(sel) = ctx.device_selector()
+            && let Some(diag) = super::diagnose_unmatched_selector(sel)
+        {
+            eprintln!("Diagnostic: {diag}");
+        } else if let Some(hint) = super::diagnose_unmatched_candidates() {
+            eprintln!("Diagnostic: {hint}");
+        }
         return Ok(());
     }
 

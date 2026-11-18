@@ -6,14 +6,17 @@
 //! to add support or debug. Every query is wrapped so a failure appends a
 //! `timeout/error` line and the report still completes.
 
-use super::{CmdCtx, CommandResult, open_preferred_transport, resolve_device};
+use super::{
+    CmdCtx, CommandResult, RawHidEntry, collect_raw_hid_entries, is_non_path_selector,
+    open_preferred_transport, resolve_device,
+};
 use iot_driver::protocol::patch_info;
 use monsgeek_keyboard::settings::FirmwareVersion;
 use monsgeek_transport::protocol::ProtocolFamily;
 use monsgeek_transport::protocol::cmd;
 use monsgeek_transport::{
-    ChecksumType, DeviceDiscovery, FlowControlTransport, HidDiscovery, Transport,
-    is_candidate_device,
+    ChecksumType, FlowControlTransport, HidDiscovery, InterfaceKind, InterfaceVerdict,
+    RejectReason, Transport, classify_interface, read_sysfs_report_descriptor,
 };
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -101,59 +104,157 @@ fn section_devices(out: &mut String) {
         }
     }
     let _ = writeln!(out);
-    section_unmatched_interfaces(out);
+    section_candidate_interfaces(out);
 }
 
-/// Candidate devices (any VID 0x3151 product, or a VID:PID from the device
-/// database) that expose no interface discovery accepts: the vendor protocol may
-/// sit on a usage page we do not look at yet. Lists each HID interface from
-/// enumeration alone; nothing is opened.
-fn section_unmatched_interfaces(out: &mut String) {
-    let Ok(api) = hidapi::HidApi::new() else {
-        return;
-    };
-    let discovered: HashSet<(u16, u16)> = HidDiscovery::new()
-        .list_devices()
-        .map(|devs| devs.iter().map(|d| (d.info.vid, d.info.pid)).collect())
-        .unwrap_or_default();
-    let mut unmatched: Vec<_> = api
-        .device_list()
-        .filter(|d| {
-            let id = (d.vendor_id(), d.product_id());
-            is_candidate_device(id.0, id.1) && !discovered.contains(&id)
+fn format_candidate_interfaces_table_with<F, M>(
+    entries: &[RawHidEntry],
+    classify_fn: F,
+    model_fn: M,
+) -> Option<String>
+where
+    F: Fn(
+        &monsgeek_transport::HidCandidateInfo,
+        Option<&monsgeek_transport::HidDescriptorSummary>,
+    ) -> InterfaceVerdict,
+    M: Fn(u16, u16) -> Option<String>,
+{
+    let mut rows: Vec<(&RawHidEntry, InterfaceVerdict)> = entries
+        .iter()
+        .filter_map(|e| {
+            let verdict = classify_fn(&e.candidate, e.descriptor.as_ref());
+            if matches!(
+                verdict,
+                InterfaceVerdict::Rejected(RejectReason::NotCandidateVidPid)
+            ) {
+                None
+            } else {
+                Some((e, verdict))
+            }
         })
         .collect();
-    if unmatched.is_empty() {
-        return;
-    }
-    unmatched.sort_by_key(|d| (d.vendor_id(), d.product_id(), d.interface_number()));
 
-    let _ = writeln!(out, "## Known devices without a supported interface");
+    if rows.is_empty() {
+        return None;
+    }
+
+    rows.sort_by(|(a, _), (b, _)| {
+        (
+            a.candidate.vid,
+            a.candidate.pid,
+            a.candidate.interface_number,
+            &a.path,
+            a.candidate.usage_page,
+            a.candidate.usage,
+        )
+            .cmp(&(
+                b.candidate.vid,
+                b.candidate.pid,
+                b.candidate.interface_number,
+                &b.path,
+                b.candidate.usage_page,
+                b.candidate.usage,
+            ))
+    });
+
+    let mut out = String::new();
+    let _ = writeln!(out, "## Candidate HID interfaces");
     let _ = writeln!(
         out,
-        "These devices are MonsGeek (VID 0x3151) products or listed in the device \
-         database, but none of their HID interfaces has the vendor usage page and \
-         usage the driver talks to."
+        "Every HID collection belonging to a MonsGeek (`0x3151`) or database-listed \
+         device, evaluated from enumeration and the kernel-cached report descriptor."
     );
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "| vid:pid | interface | usage page | usage | product |"
+        "| path | vid:pid | model | interface | usage | status | detail |"
     );
-    let _ = writeln!(out, "|---|---|---|---|---|");
-    for d in unmatched {
+    let _ = writeln!(out, "|---|---|---|---|---|---|---|");
+
+    let mut unsupported_oems: Vec<(&'static str, &'static str)> = Vec::new();
+    for (entry, verdict) in rows {
+        let mut model = model_fn(entry.candidate.vid, entry.candidate.pid)
+            .or_else(|| entry.product_name.clone())
+            .unwrap_or_else(|| "-".into());
+        if let Some(mfg) = entry.manufacturer_name.as_deref() {
+            let mfg = mfg.trim();
+            if !mfg.is_empty() && model == "-" {
+                model = mfg.to_string();
+            } else if !mfg.is_empty()
+                && !model
+                    .to_ascii_lowercase()
+                    .contains(&mfg.to_ascii_lowercase())
+            {
+                model = format!("{model} (USB: {mfg})");
+            }
+        }
+        let model = model.replace('|', "/");
+        let (status, detail) = match verdict {
+            InterfaceVerdict::Accepted(InterfaceKind::UsbFeature {
+                via_custom_rule: false,
+            }) => {
+                let d = if entry.descriptor.is_some() {
+                    "default vendor Feature interface (64B ID 0)"
+                } else {
+                    "default vendor Feature interface"
+                };
+                ("accepted", d.to_string())
+            }
+            InterfaceVerdict::Accepted(InterfaceKind::UsbFeature {
+                via_custom_rule: true,
+            }) => (
+                "accepted",
+                "database interface override (64B ID 0)".to_string(),
+            ),
+            InterfaceVerdict::Accepted(InterfaceKind::BluetoothVendor) => (
+                "accepted",
+                "Bluetooth vendor interface (0xFF55:0x0202)".to_string(),
+            ),
+            InterfaceVerdict::Rejected(ref reason) => {
+                if let RejectReason::UnsupportedOemProtocol { oem, web_url, .. } = reason
+                    && !unsupported_oems.contains(&(*oem, *web_url))
+                {
+                    unsupported_oems.push((*oem, *web_url));
+                }
+                ("rejected", reason.to_string().replace('|', "/"))
+            }
+        };
         let _ = writeln!(
             out,
-            "| {:04X}:{:04X} | {} | 0x{:04X} | 0x{:04X} | {} |",
-            d.vendor_id(),
-            d.product_id(),
-            d.interface_number(),
-            d.usage_page(),
-            d.usage(),
-            d.product_string().unwrap_or("-"),
+            "| `{}` | {:04X}:{:04X} | {} | {} | 0x{:04X}:0x{:04X} | {} | {} |",
+            entry.path,
+            entry.candidate.vid,
+            entry.candidate.pid,
+            model,
+            entry.candidate.interface_number,
+            entry.candidate.usage_page,
+            entry.candidate.usage,
+            status,
+            detail,
         );
     }
     let _ = writeln!(out);
+    for (oem, web_url) in unsupported_oems {
+        let _ = writeln!(
+            out,
+            "> **Note:** Some Akko USB `VID:PID` pairs (such as `38EE:0016`, listed as `RAID 75 HE` in `devices.json` and also used by `TAC75 HE` batches) are shared across incompatible OEMs. Units running {oem} firmware are not supported by `iot_driver` (which speaks the RongYuan protocol only); after installing udev permissions (`sudo make install-udev`), configure them in a Chromium-based browser via WebHID at {web_url}."
+        );
+        let _ = writeln!(out);
+    }
+    Some(out)
+}
+
+/// Evaluate every HID interface belonging to a candidate VID:PID from enumeration
+/// and sysfs report descriptor alone; nothing is opened.
+fn section_candidate_interfaces(out: &mut String) {
+    let entries = collect_raw_hid_entries();
+    if let Some(table) =
+        format_candidate_interfaces_table_with(&entries, classify_interface, |vid, pid| {
+            iot_driver::devices::get_device_info(vid, pid).map(|d| d.display_name)
+        })
+    {
+        out.push_str(&table);
+    }
 }
 
 /// Decode the 0xE7 patch-info response (both response framings), like `query::info`.
@@ -329,42 +430,96 @@ fn section_target(out: &mut String, ctx: &CmdCtx) {
 
 /// Dump the raw HID report descriptor of the target device (RE-critical).
 ///
-/// Uses a fresh hidapi handle and only `get_report_descriptor` (a control
-/// request); never performs an input read, which would lock the hidraw node.
+/// Prefers the kernel-cached sysfs descriptor (zero hidraw open/reads),
+/// falling back to `get_report_descriptor` only when sysfs is unavailable on a
+/// resolved device. When no supported transport resolved, dumps descriptors for
+/// `--device` or unmatched candidate interfaces via sysfs.
 fn section_report_descriptor(out: &mut String, ctx: &CmdCtx) {
     let _ = writeln!(out, "## HID report descriptor");
     let discovery = HidDiscovery::new();
-    let device = match resolve_device(&discovery, ctx.device_selector()) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = writeln!(out, "_Could not resolve target device: {e}_");
+    match resolve_device(&discovery, ctx.device_selector()) {
+        Ok(device) => {
+            let sysfs_desc =
+                read_sysfs_report_descriptor(&device.info.device_path).map(|raw| hex(&raw));
+            let result: Result<String, Box<dyn std::error::Error>> = match sysfs_desc {
+                Some(desc) => Ok(desc),
+                None => (|| -> Result<String, Box<dyn std::error::Error>> {
+                    let api = hidapi::HidApi::new()?;
+                    let cpath = std::ffi::CString::new(device.info.device_path.as_bytes())?;
+                    let hid = api.open_path(cpath.as_c_str())?;
+                    let mut buf = vec![0u8; 4096];
+                    let n = hid.get_report_descriptor(&mut buf)?;
+                    Ok(hex(&buf[..n]))
+                })(),
+            };
+
+            match result {
+                Ok(desc) if !desc.is_empty() => {
+                    let _ = writeln!(out, "- interface: `{}`", device.info.device_path);
+                    let _ = writeln!(out, "\n```\n{desc}\n```");
+                }
+                Ok(_) => {
+                    let _ = writeln!(out, "_Report descriptor was empty._");
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "_Report descriptor unavailable: {e}_");
+                }
+            }
             let _ = writeln!(out);
-            return;
-        }
-    };
-
-    let result = (|| -> Result<String, Box<dyn std::error::Error>> {
-        let api = hidapi::HidApi::new()?;
-        let cpath = std::ffi::CString::new(device.info.device_path.as_bytes())?;
-        let hid = api.open_path(cpath.as_c_str())?;
-        let mut buf = vec![0u8; 4096];
-        let n = hid.get_report_descriptor(&mut buf)?;
-        Ok(hex(&buf[..n]))
-    })();
-
-    match result {
-        Ok(desc) if !desc.is_empty() => {
-            let _ = writeln!(out, "- interface: `{}`", device.info.device_path);
-            let _ = writeln!(out, "\n```\n{desc}\n```");
-        }
-        Ok(_) => {
-            let _ = writeln!(out, "_Report descriptor was empty._");
         }
         Err(e) => {
-            let _ = writeln!(out, "_Report descriptor unavailable: {e}_");
+            let entries = collect_raw_hid_entries();
+            let mut candidates: Vec<&RawHidEntry> =
+                if let Some(sel) = ctx.device_selector().filter(|s| !is_non_path_selector(s)) {
+                    entries.iter().filter(|d| d.path.contains(sel)).collect()
+                } else {
+                    entries
+                        .iter()
+                        .filter(|d| {
+                            !matches!(
+                                classify_interface(&d.candidate, d.descriptor.as_ref()),
+                                InterfaceVerdict::Rejected(RejectReason::NotCandidateVidPid)
+                            )
+                        })
+                        .collect()
+                };
+            candidates.sort_by_key(|d| {
+                (
+                    d.candidate.vid,
+                    d.candidate.pid,
+                    d.candidate.interface_number,
+                    &d.path,
+                )
+            });
+
+            let mut seen_paths = HashSet::new();
+            let mut dumped = false;
+            for entry in candidates {
+                if !seen_paths.insert(entry.path.as_str()) {
+                    continue;
+                }
+                if let Some(raw) = read_sysfs_report_descriptor(&entry.path)
+                    && !raw.is_empty()
+                {
+                    let _ = writeln!(
+                        out,
+                        "- interface: `{}` ({:04X}:{:04X}, IF{})",
+                        entry.path,
+                        entry.candidate.vid,
+                        entry.candidate.pid,
+                        entry.candidate.interface_number,
+                    );
+                    let _ = writeln!(out, "\n```\n{}\n```\n", hex(&raw));
+                    dumped = true;
+                }
+            }
+
+            if !dumped {
+                let _ = writeln!(out, "_Could not resolve target device: {e}_");
+                let _ = writeln!(out);
+            }
         }
     }
-    let _ = writeln!(out);
 }
 
 /// Generate the diagnostic report.
@@ -384,4 +539,129 @@ pub fn run(ctx: &CmdCtx, output: Option<&Path>) -> CommandResult {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use monsgeek_transport::{
+        HidCandidateInfo, HidDescriptorSummary, UsbInterfaceRule, classify_interface_with,
+    };
+
+    const M1_V5_IF2_DESC: &[u8] = &[
+        0x06, 0xFF, 0xFF, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x02, 0x15, 0x80, 0x25, 0x7F, 0x95, 0x40,
+        0x75, 0x08, 0xB1, 0x02, 0xC0,
+    ];
+
+    const RAID75_IF0_DESC: &[u8] = &[
+        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25,
+        0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x05, 0x08,
+        0x19, 0x01, 0x29, 0x05, 0x95, 0x05, 0x75, 0x01, 0x91, 0x02, 0x95, 0x01, 0x75, 0x03, 0x91,
+        0x01, 0x05, 0x07, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x19, 0x00, 0x2A, 0xFF, 0x00, 0x95, 0x06,
+        0x75, 0x08, 0x81, 0x00, 0xC0,
+    ];
+
+    const RAID75_IF2_DESC: &[u8] = &[
+        0x06, 0x60, 0xFF, 0x09, 0x61, 0xA1, 0x01, 0x85, 0x09, 0x09, 0x62, 0x15, 0x00, 0x26, 0xFF,
+        0x00, 0x95, 0x3F, 0x75, 0x08, 0x81, 0x02, 0x09, 0x63, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x95,
+        0x3F, 0x75, 0x08, 0x91, 0x02, 0xC0, 0x06, 0x00, 0xFF, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x03,
+        0x15, 0x00, 0x26, 0xFF, 0x00, 0x19, 0x01, 0x29, 0x02, 0x75, 0x08, 0x95, 0x3F, 0xB1, 0x02,
+        0xC0,
+    ];
+
+    #[test]
+    fn candidate_interfaces_table_explains_accepted_and_rejected_entries() {
+        let known: HashSet<(u16, u16)> = [(0x38EE, 0x0016)].into_iter().collect();
+        let rules = [UsbInterfaceRule {
+            vid: 0x38EE,
+            pid: 0x0016,
+            interface_number: Some(2),
+            usage_page: 0xFF60,
+            usage: 0x0061,
+        }];
+        let entries = vec![
+            RawHidEntry {
+                path: "/dev/hidraw0".into(),
+                manufacturer_name: None,
+                product_name: Some("Razer Mamba".into()),
+                candidate: HidCandidateInfo {
+                    vid: 0x1532,
+                    pid: 0x0046,
+                    interface_number: 0,
+                    usage_page: 0x0001,
+                    usage: 0x0002,
+                    is_bluetooth: false,
+                },
+                descriptor: None,
+            },
+            RawHidEntry {
+                path: "/dev/hidraw6".into(),
+                manufacturer_name: None,
+                product_name: Some("MonsGeek M1 V5 HE".into()),
+                candidate: HidCandidateInfo {
+                    vid: 0x3151,
+                    pid: 0x5030,
+                    interface_number: 2,
+                    usage_page: 0xFFFF,
+                    usage: 0x0002,
+                    is_bluetooth: false,
+                },
+                descriptor: Some(HidDescriptorSummary::parse(M1_V5_IF2_DESC)),
+            },
+            RawHidEntry {
+                path: "/dev/hidraw9".into(),
+                manufacturer_name: Some("BY Tech".into()),
+                product_name: Some("Akko Keyboard".into()),
+                candidate: HidCandidateInfo {
+                    vid: 0x38EE,
+                    pid: 0x0016,
+                    interface_number: 0,
+                    usage_page: 0x0001,
+                    usage: 0x0006,
+                    is_bluetooth: false,
+                },
+                descriptor: Some(HidDescriptorSummary::parse(RAID75_IF0_DESC)),
+            },
+            RawHidEntry {
+                path: "/dev/hidraw11".into(),
+                manufacturer_name: Some("BY Tech".into()),
+                product_name: Some("Akko Keyboard".into()),
+                candidate: HidCandidateInfo {
+                    vid: 0x38EE,
+                    pid: 0x0016,
+                    interface_number: 2,
+                    usage_page: 0xFF60,
+                    usage: 0x0061,
+                    is_bluetooth: false,
+                },
+                descriptor: Some(HidDescriptorSummary::parse(RAID75_IF2_DESC)),
+            },
+        ];
+
+        let table = format_candidate_interfaces_table_with(
+            &entries,
+            |c, d| classify_interface_with(c, d, Some(&known), &rules),
+            |vid, pid| match (vid, pid) {
+                (0x3151, 0x5030) => Some("M1 V5 HE".into()),
+                (0x38EE, 0x0016) => Some("RAID 75 HE".into()),
+                _ => None,
+            },
+        )
+        .unwrap();
+
+        assert!(!table.contains("1532:0046"));
+        assert!(
+            table.contains(
+                "| `/dev/hidraw6` | 3151:5030 | M1 V5 HE | 2 | 0xFFFF:0x0002 | accepted |"
+            )
+        );
+        assert!(table.contains(
+            "| `/dev/hidraw9` | 38EE:0016 | RAID 75 HE (USB: BY Tech) | 0 | 0x0001:0x0006 | rejected | standard HID keyboard interface |"
+        ));
+        assert!(table.contains(
+            "| `/dev/hidraw11` | 38EE:0016 | RAID 75 HE (USB: BY Tech) | 2 | 0xFF60:0x0061 | rejected | unsupported Shenzhen Beiying (BY Tech / HubX) firmware (ID 0x09 In 63B, ID 0x09 Out 63B, ID 0x03 Feature 63B)"
+        ));
+        assert!(table.contains("> **Note:**"));
+        assert!(table.contains("https://demo.hubx.pro/keyboard/"));
+    }
 }

@@ -11,7 +11,9 @@ use tracing::{info, warn};
 /// Travel range configuration from JSON
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JsonRangeConfig {
+    #[serde(default)]
     pub min: f32,
+    #[serde(default)]
     pub max: f32,
     #[serde(default)]
     pub step: Option<f32>,
@@ -84,6 +86,15 @@ pub struct JsonDeviceDefinition {
     /// Chip family (e.g., "RY5088", "YC3123")
     #[serde(default)]
     pub chip_family: Option<String>,
+    /// Optional vendor HID usage page override for discovery (e.g. 0xFF60).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_page: Option<u16>,
+    /// Optional vendor HID usage override for discovery (e.g. 0x0061).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<u16>,
+    /// Optional USB interface number constraint for custom discovery rules (e.g. 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<i32>,
 }
 
 impl JsonDeviceDefinition {
@@ -168,7 +179,50 @@ impl JsonDeviceDefinition {
         }
         PollingRateSupport::FromFirmware(POLLING_RATE_MIN_FW_VERSION)
     }
+
+    /// Optional per-device USB HID vendor interface override for discovery.
+    ///
+    /// Prefers explicit database fields (`usagePage`/`usage`) when present, and
+    /// otherwise consults [`KNOWN_INTERFACE_OVERRIDES`] for models whose vendor
+    /// webapp bundle omits their non-standard HID usage page.
+    pub fn usb_interface_rule(&self) -> Option<monsgeek_transport::UsbInterfaceRule> {
+        if let (Some(usage_page), Some(usage)) = (self.usage_page, self.usage) {
+            return Some(monsgeek_transport::UsbInterfaceRule {
+                vid: self.vid,
+                pid: self.pid,
+                interface_number: self.interface,
+                usage_page,
+                usage,
+            });
+        }
+        KNOWN_INTERFACE_OVERRIDES
+            .iter()
+            .find(|&&(id, vid, pid, _, _, _)| id == self.id && vid == self.vid && pid == self.pid)
+            .map(
+                |&(_, vid, pid, iface, usage_page, usage)| monsgeek_transport::UsbInterfaceRule {
+                    vid,
+                    pid,
+                    interface_number: Some(iface),
+                    usage_page,
+                    usage,
+                },
+            )
+    }
 }
+
+/// Per-device USB HID vendor interface overrides for models whose hardware exposes
+/// a non-default usage page/usage not recorded in the upstream webapp bundle.
+/// Restricted to `(id, vid, pid, interface_number, usage_page, usage)` and still
+/// gated by `HidDiscovery`'s report-descriptor compatibility check so OEM VID:PID
+/// collisions (such as `38ee:0016`) cannot be misopened.
+const KNOWN_INTERFACE_OVERRIDES: &[(i32, u16, u16, i32, u16, u16)] = &[
+    // Akko `ry5088_akko_raid_75_he` (id=4049, 38ee:0016): RAID 75 HE shares 38ee:0016
+    // with Shenzhen Beiying (`BY Tech` / HubX) boards (e.g. TAC75 HE batches) whose
+    // IF2 `0xFF60:0x0061` uses 63B Report ID 0x09 In/Out. The descriptor gate accepts a
+    // 64B unnumbered Feature Report ID 0 board while rejecting BY Tech units with
+    // `UnsupportedOemProtocol`.
+    (4049, 0x38EE, 0x0016, 2, 0xFF60, 0x0061),
+];
 
 /// Whether a device exposes a polling rate control, and from which firmware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -519,8 +573,9 @@ impl DeviceDatabase {
     /// Load devices from JSON string
     /// Supports both the new versioned format and the old array format
     pub fn load_from_json(json: &str) -> Result<Self, String> {
-        // Try versioned format first
-        if let Ok(file) = serde_json::from_str::<JsonDeviceFile>(json) {
+        if json.trim_start().starts_with('{') {
+            let file: JsonDeviceFile = serde_json::from_str(json)
+                .map_err(|e| format!("Failed to parse versioned device JSON: {e}"))?;
             let mut db = Self::new();
             db.version = file.version;
             for device in file.devices {
@@ -1290,5 +1345,109 @@ mod tests {
             matrix.matrix[28],
             matrix.key_name(28).unwrap_or("?")
         );
+    }
+
+    #[test]
+    fn old_database_without_interface_fields_still_loads() {
+        let legacy = DeviceDatabase::load_from_json(TEST_JSON_LEGACY).unwrap();
+        assert_eq!(legacy.len(), 3);
+        assert!(
+            legacy
+                .find_by_id(2949)
+                .unwrap()
+                .usb_interface_rule()
+                .is_none()
+        );
+
+        let versioned = DeviceDatabase::load_from_json(TEST_JSON_VERSIONED).unwrap();
+        assert_eq!(versioned.len(), 3);
+        assert!(
+            versioned
+                .find_by_id(2248)
+                .unwrap()
+                .usb_interface_rule()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn partial_travel_range_without_max_loads() {
+        // Matches id 4088 (ry5088_akko_fun87_he_1m_8k) where firePress/fireLift omit "max".
+        let json = r#"{
+            "version": 1,
+            "devices": [{
+                "id": 4088,
+                "vid": 14574,
+                "pid": 1,
+                "name": "ry5088_akko_fun87_he_1m_8k",
+                "displayName": "FUN87 HE",
+                "type": "keyboard",
+                "travelSetting": {
+                    "firePress": {"min": 0.005, "step": 0.005},
+                    "fireLift": {"min": 0.005, "step": 0.005}
+                }
+            }]
+        }"#;
+        let db = DeviceDatabase::load_from_json(json).unwrap();
+        let dev = db.find_by_id(4088).unwrap();
+        let ts = dev.travel_setting.as_ref().unwrap();
+        assert_eq!(ts.fire_press.as_ref().unwrap().min, 0.005);
+        assert_eq!(ts.fire_press.as_ref().unwrap().max, 0.0);
+    }
+
+    #[test]
+    fn custom_hid_interface_fields_and_raid75_override_resolve() {
+        let json = r#"{
+            "version": 1,
+            "devices": [
+                {
+                    "id": 4049,
+                    "vid": 14574,
+                    "pid": 22,
+                    "name": "ry5088_akko_raid_75_he",
+                    "displayName": "RAID 75 HE",
+                    "type": "keyboard"
+                },
+                {
+                    "id": 9999,
+                    "vid": 14574,
+                    "pid": 99,
+                    "name": "custom_board",
+                    "displayName": "Custom Board",
+                    "type": "keyboard",
+                    "usagePage": 65376,
+                    "usage": 97,
+                    "interface": 2
+                }
+            ]
+        }"#;
+        let db = DeviceDatabase::load_from_json(json).unwrap();
+        assert_eq!(
+            db.find_by_id(4049).unwrap().usb_interface_rule(),
+            Some(monsgeek_transport::UsbInterfaceRule {
+                vid: 0x38EE,
+                pid: 0x0016,
+                interface_number: Some(2),
+                usage_page: 0xFF60,
+                usage: 0x0061,
+            })
+        );
+        assert_eq!(
+            db.find_by_id(9999).unwrap().usb_interface_rule(),
+            Some(monsgeek_transport::UsbInterfaceRule {
+                vid: 0x38EE,
+                pid: 99,
+                interface_number: Some(2),
+                usage_page: 0xFF60,
+                usage: 0x0061,
+            })
+        );
+    }
+
+    #[test]
+    fn versioned_json_error_preserves_object_parse_error() {
+        let err =
+            DeviceDatabase::load_from_json(r#"{"version": 1, "devices": "bad"}"#).unwrap_err();
+        assert!(err.contains("versioned device JSON"), "got: {err}");
     }
 }

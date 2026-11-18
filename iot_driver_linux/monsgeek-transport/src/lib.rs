@@ -81,8 +81,9 @@ pub use command::{
     try_parse_response,
 };
 pub use device_registry::{
-    BLUETOOTH_PIDS, DONGLE_PIDS, VENDOR_ID, is_bluetooth_pid, is_candidate_device, is_dongle_pid,
-    register_known_usb_ids,
+    BLUETOOTH_PIDS, DONGLE_PIDS, UsbInterfaceRule, VENDOR_ID, is_bluetooth_pid,
+    is_candidate_device, is_dongle_pid, known_usb_interface_rules, register_known_usb_ids,
+    register_known_usb_interface_rules,
 };
 pub use error::TransportError;
 pub use printer::{
@@ -94,7 +95,11 @@ pub use types::{
     TimestampedEvent, TransportDeviceInfo, TransportType, VendorEvent,
 };
 
-pub use discovery::{DeviceDiscovery, HidDiscovery, ProbedDevice, format_device_list};
+pub use discovery::{
+    DeviceDiscovery, HidCandidateInfo, HidDescriptorSummary, HidDiscovery, HidReportEntry,
+    HidReportKind, InterfaceKind, InterfaceVerdict, ProbedDevice, RejectReason, classify_interface,
+    classify_interface_with, format_device_list, read_sysfs_report_descriptor,
+};
 pub use flow_control::FlowControlTransport;
 pub use hid_bluetooth::HidBluetoothTransport;
 pub use hid_dongle::HidDongleTransport;

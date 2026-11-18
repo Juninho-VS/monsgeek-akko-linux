@@ -366,6 +366,13 @@ lsusb              # Verify the USB connection and note its VID:PID
 iot_driver probe   # Report; lists known boards whose HID interfaces the driver does not use
 ```
 
+Some Akko models (for example `TAC75 HE` batches under `38ee:0016`, a USB ID shared
+with `RAID 75 HE`) ship with **Shenzhen Beiying (`BY Tech` / HubX)** firmware instead
+of RongYuan (`RY5088`/`YC3123`). `iot_driver probe` identifies these interfaces;
+`iot_driver` cannot drive them, but once udev rules are installed (`sudo make install-udev`)
+they can be configured in a Chromium-based browser via WebHID at
+https://demo.hubx.pro/keyboard/.
+
 ### TUI Not Starting
 The TUI requires a proper terminal. It won't work in background mode or without a TTY.
 

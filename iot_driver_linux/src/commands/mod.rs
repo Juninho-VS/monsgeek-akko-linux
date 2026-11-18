@@ -99,6 +99,16 @@ pub(crate) fn resolve_device(
     let labeled = discovery.list_labeled_devices(resolve_model_name)?;
 
     if labeled.is_empty() {
+        if let Some(sel) = selector {
+            if let Some(diag) = diagnose_unmatched_selector(sel) {
+                return Err(monsgeek_transport::TransportError::DeviceNotFound(diag).into());
+            }
+        } else if let Some(hint) = diagnose_unmatched_candidates() {
+            return Err(monsgeek_transport::TransportError::DeviceNotFound(format!(
+                "No supported device found ({hint})"
+            ))
+            .into());
+        }
         return Err(monsgeek_transport::TransportError::DeviceNotFound(
             "No supported device found".into(),
         )
@@ -154,6 +164,9 @@ pub(crate) fn resolve_device(
             .into());
         }
 
+        if let Some(diag) = diagnose_unmatched_selector(sel) {
+            return Err(monsgeek_transport::TransportError::DeviceNotFound(diag).into());
+        }
         return Err(format!("No device matches '{sel}'").into());
     }
 
@@ -512,4 +525,563 @@ pub fn create_printer_config(
     }
 
     Ok(Some(config))
+}
+
+/// Raw HID enumeration entry paired with optional read-only sysfs report descriptor.
+#[derive(Debug, Clone)]
+pub(crate) struct RawHidEntry {
+    pub path: String,
+    pub manufacturer_name: Option<String>,
+    pub product_name: Option<String>,
+    pub candidate: monsgeek_transport::HidCandidateInfo,
+    pub descriptor: Option<monsgeek_transport::HidDescriptorSummary>,
+}
+
+/// Returns true if `--device` selector is an index or transport-type keyword rather
+/// than a HID device path fragment.
+pub(crate) fn is_non_path_selector(selector: &str) -> bool {
+    selector.parse::<usize>().is_ok() || matches!(selector, "usb" | "dongle" | "bt")
+}
+
+/// Enumerate all HID interfaces via `hidapi` and enrich them with read-only sysfs
+/// report descriptor summaries. Never opens any `/dev/hidraw*` device.
+pub(crate) fn collect_raw_hid_entries() -> Vec<RawHidEntry> {
+    let Ok(api) = hidapi::HidApi::new() else {
+        return Vec::new();
+    };
+    api.device_list()
+        .map(|d| {
+            let path = d.path().to_string_lossy().to_string();
+            let descriptor = monsgeek_transport::read_sysfs_report_descriptor(&path)
+                .map(|raw| monsgeek_transport::HidDescriptorSummary::parse(&raw));
+            RawHidEntry {
+                path,
+                manufacturer_name: d.manufacturer_string().map(str::to_string),
+                product_name: d.product_string().map(str::to_string),
+                candidate: monsgeek_transport::HidCandidateInfo::from_device_info(d),
+                descriptor,
+            }
+        })
+        .collect()
+}
+
+/// Strip control characters/newlines and underscores from diagnostic strings so
+/// `DeviceNotFound` messages remain single-line and safe inside Markdown italics.
+fn sanitize_diag_text(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '_' => '-',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_usb_product_label(
+    manufacturer_name: Option<&str>,
+    product_name: Option<&str>,
+) -> Option<String> {
+    let mfg = manufacturer_name
+        .map(sanitize_diag_text)
+        .filter(|s| !s.is_empty());
+    let prod = product_name
+        .map(sanitize_diag_text)
+        .filter(|s| !s.is_empty());
+    match (mfg, prod) {
+        (Some(m), Some(p)) => {
+            if p.to_ascii_lowercase().contains(&m.to_ascii_lowercase()) {
+                Some(p)
+            } else {
+                Some(format!("{m} {p}"))
+            }
+        }
+        (Some(m), None) => Some(m),
+        (None, Some(p)) => Some(p),
+        (None, None) => None,
+    }
+}
+
+pub(crate) fn format_candidate_identity(
+    manufacturer_name: Option<&str>,
+    product_name: Option<&str>,
+    db_model: Option<String>,
+) -> Option<String> {
+    let usb = format_usb_product_label(manufacturer_name, product_name);
+    let db = db_model
+        .as_deref()
+        .map(sanitize_diag_text)
+        .filter(|s| !s.is_empty());
+    match (usb, db) {
+        (Some(u), Some(d)) => {
+            let u_low = u.to_ascii_lowercase();
+            let d_low = d.to_ascii_lowercase();
+            if u_low == d_low || u_low.contains(&d_low) {
+                Some(u)
+            } else if d_low.contains(&u_low) {
+                Some(d)
+            } else {
+                Some(format!("USB: {u}, DB: {d}"))
+            }
+        }
+        (None, Some(d)) => Some(d),
+        (Some(u), None) => Some(u),
+        (None, None) => None,
+    }
+}
+
+fn verdict_diagnostic_priority(verdict: &monsgeek_transport::InterfaceVerdict) -> u8 {
+    use monsgeek_transport::{InterfaceVerdict, RejectReason};
+    match verdict {
+        InterfaceVerdict::Rejected(RejectReason::UnsupportedOemProtocol { .. }) => 7,
+        InterfaceVerdict::Rejected(RejectReason::IncompatibleReportDescriptor { .. }) => 6,
+        InterfaceVerdict::Rejected(RejectReason::UnverifiedCustomDescriptor) => 5,
+        InterfaceVerdict::Rejected(RejectReason::WrongInterfaceNumber { .. }) => 4,
+        InterfaceVerdict::Rejected(
+            RejectReason::StandardKeyboard
+            | RejectReason::ConsumerOrSystemControl
+            | RejectReason::VendorEventInput
+            | RejectReason::UnsupportedBluetoothUsage,
+        ) => 3,
+        InterfaceVerdict::Rejected(RejectReason::UnsupportedUsage { .. }) => 2,
+        InterfaceVerdict::Rejected(RejectReason::NotCandidateVidPid) => 1,
+        InterfaceVerdict::Accepted(_) => 0,
+    }
+}
+
+fn format_verdict_reason(verdict: Option<monsgeek_transport::InterfaceVerdict>) -> String {
+    match verdict {
+        Some(monsgeek_transport::InterfaceVerdict::Rejected(r)) => {
+            sanitize_diag_text(&r.to_string())
+        }
+        Some(monsgeek_transport::InterfaceVerdict::Accepted(_)) => {
+            "interface is compatible, but device did not resolve through discovery".to_string()
+        }
+        None => "no HID collections reported".to_string(),
+    }
+}
+
+pub(crate) fn format_unmatched_selector_diagnostic_with<F, M>(
+    selector: &str,
+    entries: &[RawHidEntry],
+    classify_fn: F,
+    model_fn: M,
+) -> Option<String>
+where
+    F: Fn(
+        &monsgeek_transport::HidCandidateInfo,
+        Option<&monsgeek_transport::HidDescriptorSummary>,
+    ) -> monsgeek_transport::InterfaceVerdict,
+    M: Fn(u16, u16) -> Option<String>,
+{
+    if is_non_path_selector(selector) {
+        return None;
+    }
+
+    let mut groups: Vec<(&str, Vec<&RawHidEntry>)> = Vec::new();
+    for entry in entries.iter().filter(|e| e.path.contains(selector)) {
+        if let Some((_, list)) = groups.iter_mut().find(|(p, _)| *p == entry.path) {
+            list.push(entry);
+        } else {
+            groups.push((entry.path.as_str(), vec![entry]));
+        }
+    }
+
+    if groups.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::with_capacity(groups.len());
+    for (path, group) in groups {
+        let first = group[0];
+        let (vid, pid, iface) = (
+            first.candidate.vid,
+            first.candidate.pid,
+            first.candidate.interface_number,
+        );
+        let identity = format_candidate_identity(
+            first.manufacturer_name.as_deref(),
+            first.product_name.as_deref(),
+            model_fn(vid, pid),
+        );
+        let usages: Vec<String> = group
+            .iter()
+            .map(|e| {
+                format!(
+                    "0x{:04X}:0x{:04X}",
+                    e.candidate.usage_page, e.candidate.usage
+                )
+            })
+            .collect();
+
+        let mut best: Option<(u8, monsgeek_transport::InterfaceVerdict)> = None;
+        for entry in &group {
+            let verdict = classify_fn(&entry.candidate, entry.descriptor.as_ref());
+            let prio = verdict_diagnostic_priority(&verdict);
+            if best.as_ref().is_none_or(|(best_prio, _)| prio > *best_prio) {
+                best = Some((prio, verdict));
+            }
+        }
+
+        let reason = format_verdict_reason(best.map(|(_, v)| v));
+        let label = match identity {
+            Some(details) => format!("{vid:04X}:{pid:04X}, {details}"),
+            None => format!("{vid:04X}:{pid:04X}"),
+        };
+        let path_clean = sanitize_diag_text(path);
+        lines.push(format!(
+            "Device '{path_clean}' ({label}, interface {iface}, usage {}) cannot be used: {reason}",
+            usages.join(", ")
+        ));
+    }
+
+    Some(lines.join("; "))
+}
+
+pub(crate) fn format_unmatched_candidates_hint_with<F, M>(
+    entries: &[RawHidEntry],
+    classify_fn: F,
+    model_fn: M,
+) -> Option<String>
+where
+    F: Fn(
+        &monsgeek_transport::HidCandidateInfo,
+        Option<&monsgeek_transport::HidDescriptorSummary>,
+    ) -> monsgeek_transport::InterfaceVerdict,
+    M: Fn(u16, u16) -> Option<String>,
+{
+    struct CandidateGroup<'a> {
+        vid: u16,
+        pid: u16,
+        verdicts: Vec<(&'a RawHidEntry, monsgeek_transport::InterfaceVerdict)>,
+    }
+
+    let mut groups: Vec<CandidateGroup<'_>> = Vec::new();
+
+    for entry in entries {
+        let verdict = classify_fn(&entry.candidate, entry.descriptor.as_ref());
+        if matches!(
+            verdict,
+            monsgeek_transport::InterfaceVerdict::Rejected(
+                monsgeek_transport::RejectReason::NotCandidateVidPid
+            )
+        ) {
+            continue;
+        }
+        let (vid, pid) = (entry.candidate.vid, entry.candidate.pid);
+        if let Some(group) = groups.iter_mut().find(|g| g.vid == vid && g.pid == pid) {
+            group.verdicts.push((entry, verdict));
+        } else {
+            groups.push(CandidateGroup {
+                vid,
+                pid,
+                verdicts: vec![(entry, verdict)],
+            });
+        }
+    }
+
+    let mut hints = Vec::new();
+    for CandidateGroup { vid, pid, verdicts } in groups {
+        if verdicts
+            .iter()
+            .any(|(_, v)| matches!(v, monsgeek_transport::InterfaceVerdict::Accepted(_)))
+        {
+            continue;
+        }
+        let mut best: Option<(u8, &RawHidEntry, monsgeek_transport::InterfaceVerdict)> = None;
+        for (entry, verdict) in verdicts {
+            let prio = verdict_diagnostic_priority(&verdict);
+            if best
+                .as_ref()
+                .is_none_or(|(best_prio, _, _)| prio > *best_prio)
+            {
+                best = Some((prio, entry, verdict));
+            }
+        }
+        if let Some((_, entry, verdict)) = best {
+            let identity = format_candidate_identity(
+                entry.manufacturer_name.as_deref(),
+                entry.product_name.as_deref(),
+                model_fn(vid, pid),
+            );
+            let reason = format_verdict_reason(Some(verdict));
+            let path_clean = sanitize_diag_text(&entry.path);
+            let hint = match identity {
+                Some(details) => {
+                    format!("candidate {vid:04X}:{pid:04X} ({details}) at {path_clean}: {reason}")
+                }
+                None => format!("candidate {vid:04X}:{pid:04X} at {path_clean}: {reason}"),
+            };
+            hints.push(hint);
+        }
+    }
+
+    if hints.is_empty() {
+        None
+    } else {
+        Some(hints.join("; "))
+    }
+}
+
+pub(crate) fn format_unmatched_selector_diagnostic(
+    selector: &str,
+    entries: &[RawHidEntry],
+) -> Option<String> {
+    format_unmatched_selector_diagnostic_with(
+        selector,
+        entries,
+        monsgeek_transport::classify_interface,
+        |vid, pid| iot_driver::devices::get_device_info(vid, pid).map(|d| d.display_name),
+    )
+}
+
+pub(crate) fn diagnose_unmatched_selector(selector: &str) -> Option<String> {
+    if is_non_path_selector(selector) {
+        return None;
+    }
+    let entries = collect_raw_hid_entries();
+    format_unmatched_selector_diagnostic(selector, &entries)
+}
+
+pub(crate) fn diagnose_unmatched_candidates() -> Option<String> {
+    let entries = collect_raw_hid_entries();
+    format_unmatched_candidates_hint_with(
+        &entries,
+        monsgeek_transport::classify_interface,
+        |vid, pid| iot_driver::devices::get_device_info(vid, pid).map(|d| d.display_name),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use monsgeek_transport::{
+        HidCandidateInfo, HidDescriptorSummary, UsbInterfaceRule, classify_interface_with,
+    };
+    use std::collections::HashSet;
+
+    const RAID75_IF0_DESC: &[u8] = &[
+        0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25,
+        0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x95, 0x01, 0x75, 0x08, 0x81, 0x01, 0x05, 0x08,
+        0x19, 0x01, 0x29, 0x05, 0x95, 0x05, 0x75, 0x01, 0x91, 0x02, 0x95, 0x01, 0x75, 0x03, 0x91,
+        0x01, 0x05, 0x07, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x19, 0x00, 0x2A, 0xFF, 0x00, 0x95, 0x06,
+        0x75, 0x08, 0x81, 0x00, 0xC0,
+    ];
+
+    const RAID75_IF1_DESC: &[u8] = &[
+        0x05, 0x0C, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x04, 0x19, 0x00, 0x2A, 0xFF, 0x1F, 0x15, 0x00,
+        0x26, 0xFF, 0x1F, 0x75, 0x10, 0x95, 0x01, 0x81, 0x00, 0xC0, 0x05, 0x01, 0x09, 0x80, 0xA1,
+        0x01, 0x85, 0x05, 0x1A, 0x81, 0x00, 0x2A, 0x83, 0x00, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01,
+        0x95, 0x03, 0x81, 0x02, 0x95, 0x05, 0x81, 0x01, 0xC0, 0x05, 0x01, 0x09, 0x06, 0xA1, 0x01,
+        0x85, 0x07, 0x05, 0x07, 0x25, 0x01, 0x19, 0x00, 0x29, 0x9F, 0x95, 0xA0, 0x75, 0x01, 0x81,
+        0x02, 0xC0, 0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, 0x09, 0x01, 0xA1, 0x00, 0x05,
+        0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01, 0x95, 0x05, 0x75, 0x01, 0x81, 0x02,
+        0x95, 0x01, 0x75, 0x03, 0x81, 0x01, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38, 0x15,
+        0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06, 0xC0, 0x09, 0x3C, 0x05, 0xFF, 0x09,
+        0x01, 0x15, 0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x02, 0xB1, 0x22, 0x75, 0x06, 0x95, 0x01,
+        0xB1, 0x01, 0xC0,
+    ];
+
+    const RAID75_IF2_DESC: &[u8] = &[
+        0x06, 0x60, 0xFF, 0x09, 0x61, 0xA1, 0x01, 0x85, 0x09, 0x09, 0x62, 0x15, 0x00, 0x26, 0xFF,
+        0x00, 0x95, 0x3F, 0x75, 0x08, 0x81, 0x02, 0x09, 0x63, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x95,
+        0x3F, 0x75, 0x08, 0x91, 0x02, 0xC0, 0x06, 0x00, 0xFF, 0x09, 0x01, 0xA1, 0x01, 0x85, 0x03,
+        0x15, 0x00, 0x26, 0xFF, 0x00, 0x19, 0x01, 0x29, 0x02, 0x75, 0x08, 0x95, 0x3F, 0xB1, 0x02,
+        0xC0,
+    ];
+
+    fn sample_entries() -> Vec<RawHidEntry> {
+        let if0 = HidDescriptorSummary::parse(RAID75_IF0_DESC);
+        let if1 = HidDescriptorSummary::parse(RAID75_IF1_DESC);
+        let if2 = HidDescriptorSummary::parse(RAID75_IF2_DESC);
+        vec![
+            RawHidEntry {
+                path: "/dev/hidraw0".into(),
+                manufacturer_name: None,
+                product_name: Some("Razer Mamba".into()),
+                candidate: HidCandidateInfo {
+                    vid: 0x1532,
+                    pid: 0x0046,
+                    interface_number: 0,
+                    usage_page: 0x0001,
+                    usage: 0x0002,
+                    is_bluetooth: false,
+                },
+                descriptor: None,
+            },
+            RawHidEntry {
+                path: "/dev/hidraw9".into(),
+                manufacturer_name: Some("BY Tech".into()),
+                product_name: Some("Akko Keyboard".into()),
+                candidate: HidCandidateInfo {
+                    vid: 0x38EE,
+                    pid: 0x0016,
+                    interface_number: 0,
+                    usage_page: 0x0001,
+                    usage: 0x0006,
+                    is_bluetooth: false,
+                },
+                descriptor: Some(if0),
+            },
+            RawHidEntry {
+                path: "/dev/hidraw10".into(),
+                manufacturer_name: Some("BY Tech".into()),
+                product_name: Some("Akko Keyboard".into()),
+                candidate: HidCandidateInfo {
+                    vid: 0x38EE,
+                    pid: 0x0016,
+                    interface_number: 1,
+                    usage_page: 0x000C,
+                    usage: 0x0001,
+                    is_bluetooth: false,
+                },
+                descriptor: Some(if1.clone()),
+            },
+            RawHidEntry {
+                path: "/dev/hidraw10".into(),
+                manufacturer_name: Some("BY Tech".into()),
+                product_name: Some("Akko Keyboard".into()),
+                candidate: HidCandidateInfo {
+                    vid: 0x38EE,
+                    pid: 0x0016,
+                    interface_number: 1,
+                    usage_page: 0x0001,
+                    usage: 0x0006,
+                    is_bluetooth: false,
+                },
+                descriptor: Some(if1),
+            },
+            RawHidEntry {
+                path: "/dev/hidraw11".into(),
+                manufacturer_name: Some("BY Tech".into()),
+                product_name: Some("Akko Keyboard".into()),
+                candidate: HidCandidateInfo {
+                    vid: 0x38EE,
+                    pid: 0x0016,
+                    interface_number: 2,
+                    usage_page: 0xFF60,
+                    usage: 0x0061,
+                    is_bluetooth: false,
+                },
+                descriptor: Some(if2.clone()),
+            },
+            RawHidEntry {
+                path: "/dev/hidraw11".into(),
+                manufacturer_name: Some("BY Tech".into()),
+                product_name: Some("Akko Keyboard".into()),
+                candidate: HidCandidateInfo {
+                    vid: 0x38EE,
+                    pid: 0x0016,
+                    interface_number: 2,
+                    usage_page: 0xFF00,
+                    usage: 0x0001,
+                    is_bluetooth: false,
+                },
+                descriptor: Some(if2),
+            },
+        ]
+    }
+
+    fn diag_for(selector: &str, entries: &[RawHidEntry]) -> Option<String> {
+        let known: HashSet<(u16, u16)> = [(0x38EE, 0x0016)].into_iter().collect();
+        let rules = [UsbInterfaceRule {
+            vid: 0x38EE,
+            pid: 0x0016,
+            interface_number: Some(2),
+            usage_page: 0xFF60,
+            usage: 0x0061,
+        }];
+        format_unmatched_selector_diagnostic_with(
+            selector,
+            entries,
+            |c, d| classify_interface_with(c, d, Some(&known), &rules),
+            |vid, pid| match (vid, pid) {
+                (0x38EE, 0x0016) => Some("RAID 75 HE".into()),
+                _ => None,
+            },
+        )
+    }
+
+    #[test]
+    fn device_selector_reports_helpful_diagnostics_on_unmatched_interfaces() {
+        let entries = sample_entries();
+
+        let d11 = diag_for("/dev/hidraw11", &entries).unwrap();
+        assert!(d11.contains("38EE:0016"), "got: {d11}");
+        assert!(d11.contains("USB: BY Tech Akko Keyboard"), "got: {d11}");
+        assert!(d11.contains("DB: RAID 75 HE"), "got: {d11}");
+        assert!(d11.contains("interface 2"), "got: {d11}");
+        assert!(d11.contains("0xFF60:0x0061"), "got: {d11}");
+        assert!(
+            d11.contains("Shenzhen Beiying (BY Tech / HubX)"),
+            "got: {d11}"
+        );
+        assert!(
+            d11.contains("https://demo.hubx.pro/keyboard/"),
+            "got: {d11}"
+        );
+        assert!(
+            d11.contains("ID 0x09 In 63B, ID 0x09 Out 63B, ID 0x03 Feature 63B"),
+            "got: {d11}"
+        );
+        assert!(!d11.contains('\n') && !d11.contains('_'), "got: {d11}");
+
+        let d9 = diag_for("/dev/hidraw9", &entries).unwrap();
+        assert!(d9.contains("interface 0"));
+        assert!(d9.contains("standard HID keyboard interface"));
+
+        let d10 = diag_for("/dev/hidraw10", &entries).unwrap();
+        assert!(d10.contains("interface 1"));
+        assert!(d10.contains("consumer/system control interface"));
+
+        let d0 = diag_for("/dev/hidraw0", &entries).unwrap();
+        assert!(d0.contains("1532:0046"));
+        assert!(d0.contains("Razer Mamba"));
+        assert!(d0.contains("not in the device database"));
+
+        assert!(diag_for("0", &entries).is_none());
+        assert!(diag_for("usb", &entries).is_none());
+        assert!(diag_for("/dev/hidraw99", &entries).is_none());
+    }
+
+    #[test]
+    fn unmatched_candidates_hint_summarizes_beiying_collision_in_one_line() {
+        let entries = sample_entries();
+        let known: HashSet<(u16, u16)> = [(0x38EE, 0x0016)].into_iter().collect();
+        let rules = [UsbInterfaceRule {
+            vid: 0x38EE,
+            pid: 0x0016,
+            interface_number: Some(2),
+            usage_page: 0xFF60,
+            usage: 0x0061,
+        }];
+
+        let hint = format_unmatched_candidates_hint_with(
+            &entries,
+            |c, d| classify_interface_with(c, d, Some(&known), &rules),
+            |vid, pid| match (vid, pid) {
+                (0x38EE, 0x0016) => Some("RAID 75 HE".into()),
+                _ => None,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            hint.contains(
+                "candidate 38EE:0016 (USB: BY Tech Akko Keyboard, DB: RAID 75 HE) at /dev/hidraw11:"
+            ),
+            "got: {hint}"
+        );
+        assert!(
+            hint.contains("Shenzhen Beiying (BY Tech / HubX)"),
+            "got: {hint}"
+        );
+        assert!(
+            hint.contains("https://demo.hubx.pro/keyboard/"),
+            "got: {hint}"
+        );
+        assert!(!hint.contains('\n') && !hint.contains('_'), "got: {hint}");
+    }
 }

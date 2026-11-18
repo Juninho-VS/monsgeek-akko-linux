@@ -14,6 +14,10 @@ pub fn list() -> CommandResult {
     let labeled = discovery.list_labeled_devices(resolve_name)?;
     if labeled.is_empty() {
         println!("No supported devices found.");
+        if let Some(hint) = super::diagnose_unmatched_candidates() {
+            println!("Note: {hint}");
+            println!("Run 'iot_driver probe' for a full HID interface report.");
+        }
         return Ok(());
     }
 

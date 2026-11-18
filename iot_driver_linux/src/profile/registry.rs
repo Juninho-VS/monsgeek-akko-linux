@@ -61,6 +61,9 @@ impl ProfileRegistry {
         match DeviceDatabase::load_default() {
             Ok(db) => {
                 monsgeek_transport::register_known_usb_ids(keyboard_usb_ids(&db));
+                monsgeek_transport::register_known_usb_interface_rules(
+                    keyboard_usb_interface_rules(&db),
+                );
                 self.device_db = Some(db);
             }
             Err(e) => {
@@ -313,6 +316,23 @@ fn keyboard_usb_ids(db: &DeviceDatabase) -> impl Iterator<Item = (u16, u16)> + '
         .map(|d| (d.vid, d.pid))
 }
 
+/// Deduplicated per-device USB interface overrides for the database's keyboards.
+fn keyboard_usb_interface_rules(db: &DeviceDatabase) -> Vec<monsgeek_transport::UsbInterfaceRule> {
+    let mut seen = std::collections::HashSet::new();
+    let mut rules = Vec::new();
+    for d in db
+        .all_devices()
+        .filter(|d| d.id >= 0 && matches!(d.device_type.as_str(), "keyboard" | "hitBoxKeyboard"))
+    {
+        if let Some(rule) = d.usb_interface_rule()
+            && seen.insert(rule)
+        {
+            rules.push(rule);
+        }
+    }
+    rules
+}
+
 impl Default for ProfileRegistry {
     fn default() -> Self {
         Self::with_builtins()
@@ -335,10 +355,16 @@ mod tests {
 
     #[test]
     fn discovery_ids_are_the_databases_keyboards() {
-        let Ok(db) = DeviceDatabase::load_from_file("../data/devices.json") else {
+        let Some(devices_path) = ["../data/devices.json", "data/devices.json"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+        else {
             eprintln!("data/devices.json not found, skipping");
             return;
         };
+        let mut db =
+            DeviceDatabase::load_from_file(devices_path).expect("devices.json must parse cleanly");
         let ids: std::collections::HashSet<_> = keyboard_usb_ids(&db).collect();
         assert!(ids.contains(&(0x38EE, 0x0016)), "Akko RAID 75 HE");
         assert!(ids.contains(&(0x3151, 0x5030)), "M1 V5 HE wired");
@@ -347,6 +373,28 @@ mod tests {
             !ids.contains(&(0x046A, 0x012E)),
             "a negative-id placeholder"
         );
+
+        let rules = keyboard_usb_interface_rules(&db);
+        assert!(rules.contains(&monsgeek_transport::UsbInterfaceRule {
+            vid: 0x38EE,
+            pid: 0x0016,
+            interface_number: Some(2),
+            usage_page: 0xFF60,
+            usage: 0x0061,
+        }));
+
+        if let Some(matrices_path) = ["../data/device_matrices.json", "data/device_matrices.json"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+        {
+            db.load_matrices_from_file(matrices_path)
+                .expect("device_matrices.json must parse cleanly");
+            assert!(
+                db.get_matrix(0x38EE, 0x0016, 4049).is_some(),
+                "Akko RAID 75 HE matrix entry (id=4049) should resolve"
+            );
+        }
     }
 
     #[test]
