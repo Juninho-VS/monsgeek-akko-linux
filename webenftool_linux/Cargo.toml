@@ -1,0 +1,27 @@
+[package]
+name = "webenftool_linux"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+description = "Native Linux companion daemon and audio-reactive RGB driver for Beiying/HubX keyboards (Akko TAC75 HE, etc.)"
+
+[[bin]]
+name = "webenftool-linux"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+hidapi = "2.6"
+httparse = "1.10"
+libc = "0.2"
+libpulse-binding = "2.30"
+libpulse-simple-binding = "2.29"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+spectrum-analyzer = "1.4"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
