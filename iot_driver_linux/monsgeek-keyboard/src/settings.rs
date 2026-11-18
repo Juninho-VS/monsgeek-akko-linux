@@ -13,6 +13,8 @@ pub enum Precision {
     Medium,
     /// 0.005mm resolution (high precision)
     Fine,
+    /// 0.001mm (1 µm) resolution
+    UltraFine,
 }
 
 impl Precision {
@@ -49,15 +51,17 @@ impl Precision {
     /// E.g., raw value 100 with factor 100 = 1.0mm
     pub fn factor(&self) -> f64 {
         match self {
-            Self::Fine => 200.0,   // 0.005mm steps
-            Self::Medium => 100.0, // 0.01mm steps
-            Self::Coarse => 10.0,  // 0.1mm steps
+            Self::UltraFine => 1000.0, // 0.001mm steps
+            Self::Fine => 200.0,       // 0.005mm steps
+            Self::Medium => 100.0,     // 0.01mm steps
+            Self::Coarse => 10.0,      // 0.1mm steps
         }
     }
 
     /// Get precision as display string
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::UltraFine => "0.001mm",
             Self::Fine => "0.005mm",
             Self::Medium => "0.01mm",
             Self::Coarse => "0.1mm",
@@ -81,20 +85,22 @@ impl Precision {
     /// this many places means no rounding happens on the way to the screen.
     pub const fn decimals(&self) -> u32 {
         match self {
-            Self::Coarse => 1, // 0.1mm
-            Self::Medium => 2, // 0.01mm
-            Self::Fine => 3,   // 0.005mm
+            Self::Coarse => 1,    // 0.1mm
+            Self::Medium => 2,    // 0.01mm
+            Self::Fine => 3,      // 0.005mm
+            Self::UltraFine => 3, // 0.001mm
         }
     }
 
     /// Raw travel in micrometres — exact integer arithmetic, since 1000µm is a
-    /// whole multiple of every unit size (100 / 10 / 5 µm).
+    /// whole multiple of every unit size (100 / 10 / 5 / 1 µm).
     pub const fn raw_to_um(&self, raw: u16) -> u32 {
         raw as u32
             * match self {
                 Self::Coarse => 100,
                 Self::Medium => 10,
                 Self::Fine => 5,
+                Self::UltraFine => 1,
             }
     }
 }

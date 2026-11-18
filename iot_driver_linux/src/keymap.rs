@@ -90,6 +90,33 @@ pub fn device_default_keycode(kb: &KeyboardInterface, pos: MatrixPos) -> HidUsag
         .unwrap_or_else(|| default_keycode(pos))
 }
 
+/// Resolve a key reference (such as `"A"`, `"Fn+Caps"`, `"42"`) against the
+/// connected keyboard's actual key names before falling back to generic `KeyRef::from_str`.
+pub fn resolve_key_ref(kb: &KeyboardInterface, spec: &str) -> Result<KeyRef, String> {
+    if !kb.is_beiying() {
+        return spec.parse();
+    }
+    let (layer, key_tok) = if let Some((prefix, rest)) = spec.split_once('+') {
+        let layer = if prefix.eq_ignore_ascii_case("fn") {
+            Layer::Fn
+        } else if prefix.eq_ignore_ascii_case("l1") || prefix.eq_ignore_ascii_case("layer1") {
+            Layer::Layer1
+        } else {
+            return spec.parse();
+        };
+        (layer, rest)
+    } else {
+        (Layer::Base, spec)
+    };
+    for i in 0..kb.matrix_size() {
+        let name = kb.matrix_key_name(i);
+        if !name.is_empty() && name != "?" && name.eq_ignore_ascii_case(key_tok) {
+            return Ok(KeyRef::new(MatrixPos::new(i as u8), layer));
+        }
+    }
+    spec.parse()
+}
+
 /// Reset a key to its firmware default.
 ///
 /// The base layer has **no ROM fallback** (firmware-confirmed): an all-zero
@@ -223,7 +250,11 @@ pub fn load_key_rows(
     // device database names. The encoder's mode toggle sits at 92 and its
     // alternate rotation bindings at 96/97 — all unnamed, and all invisible while
     // this walked `0..matrix_positions()`.
-    let key_count = MATRIX_POSITIONS;
+    let key_count = if kb.is_beiying() {
+        kb.matrix_size()
+    } else {
+        MATRIX_POSITIONS
+    };
 
     // Keymatrix layers 0–3 (outputs / DKS combos) + the separate Fn table.
     let profile = kb.active_profile();

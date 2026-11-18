@@ -11,7 +11,9 @@ use tracing::{info, warn};
 /// Travel range configuration from JSON
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JsonRangeConfig {
+    #[serde(default)]
     pub min: f32,
+    #[serde(default)]
     pub max: f32,
     #[serde(default)]
     pub step: Option<f32>,

@@ -951,6 +951,10 @@ impl Transport for Printer {
     fn subscribe_events(&self) -> Option<broadcast::Receiver<TimestampedEvent>> {
         self.inner.as_ref()?.subscribe_events()
     }
+
+    fn as_beiying(&self) -> Option<&crate::beiying::HidBeiyingTransport> {
+        self.inner.as_ref()?.as_beiying()
+    }
 }
 
 #[cfg(test)]

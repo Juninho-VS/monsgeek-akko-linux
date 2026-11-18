@@ -499,6 +499,10 @@ impl Transport for FlowControlTransport {
     fn get_dongle_patch_info(&self) -> Result<Option<Vec<u8>>, TransportError> {
         self.inner.get_dongle_patch_info()
     }
+
+    fn as_beiying(&self) -> Option<&crate::beiying::HidBeiyingTransport> {
+        self.inner.as_beiying()
+    }
 }
 
 // ============================================================================
@@ -507,6 +511,11 @@ impl Transport for FlowControlTransport {
 
 /// Extension trait for sending typed commands via FlowControlTransport
 impl FlowControlTransport {
+    /// Access the underlying Beiying `Report ID 0x09` transport if active.
+    pub fn as_beiying(&self) -> Option<&crate::beiying::HidBeiyingTransport> {
+        self.inner.as_beiying()
+    }
+
     /// Send a typed command (fire-and-forget)
     pub fn send<C: HidCommand + Send + Sync>(&self, cmd: &C) -> Result<(), TransportError> {
         self.send_command(C::CMD, &cmd.to_data(), C::CHECKSUM)

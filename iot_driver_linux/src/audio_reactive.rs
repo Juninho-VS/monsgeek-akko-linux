@@ -4,7 +4,7 @@
 use spectrum_analyzer::scaling::divide_by_N_sqrt;
 use spectrum_analyzer::windows::hann_window;
 use spectrum_analyzer::{FrequencyLimit, samples_fft_to_spectrum};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use crate::protocol::{audio_viz, cmd};
 use crate::pulse;
 use monsgeek_keyboard::KeyboardInterface;
+use monsgeek_transport::beiying::HidBeiyingTransport;
 use monsgeek_transport::{ChecksumType, Transport};
 
 /// Number of frequency bands to analyze. Matches the device's 16 audio-viz
@@ -61,6 +62,10 @@ pub struct AudioState {
     /// Target update rate (Hz) for the FFT + send loops; live-adjustable to trade
     /// CPU/USB traffic against fidelity. Clamped to [5, 120] when used.
     pub target_hz: AtomicU32,
+    /// Visual style index when streaming to Beiying per-key RGB (`0..=2`).
+    pub beiying_style: AtomicU8,
+    /// Packed solid RGB (`0x01_RRGGBB` when solid custom color enabled, `0` = rainbow).
+    pub beiying_solid_rgb: AtomicU32,
 }
 
 impl Default for AudioState {
@@ -73,6 +78,8 @@ impl Default for AudioState {
             fft_hz: AtomicU32::new(0),
             tx_hz: AtomicU32::new(0),
             target_hz: AtomicU32::new(50),
+            beiying_style: AtomicU8::new(0),
+            beiying_solid_rgb: AtomicU32::new(0),
         }
     }
 }
@@ -130,6 +137,7 @@ impl AudioCapture {
         state
             .target_hz
             .store(clamp_hz(config.update_hz), Ordering::SeqCst);
+        state.beiying_style.store(config.style, Ordering::Relaxed);
         let source_label = source.label();
 
         let sample_buffer: Arc<Mutex<Vec<f32>>> =
@@ -407,8 +415,130 @@ pub fn run_audio_reactive(
     Ok(())
 }
 
+fn hsv_to_rgb(h_deg: f32, s: f32, v: f32) -> [u8; 3] {
+    let h = h_deg.rem_euclid(360.0) / 60.0;
+    let c = v.clamp(0.0, 1.0) * s.clamp(0.0, 1.0);
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let m = v.clamp(0.0, 1.0) - c;
+    let (r1, g1, b1) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
+}
+
+fn scale_rgb(rgb: [u8; 3], factor: f32) -> [u8; 3] {
+    let f = factor.clamp(0.0, 1.0);
+    [
+        (rgb[0] as f32 * f).round() as u8,
+        (rgb[1] as f32 * f).round() as u8,
+        (rgb[2] as f32 * f).round() as u8,
+    ]
+}
+
+/// Compute per-slot RGB frame and side lightbar RGB for BYTech/Beiying hardware.
+pub fn compute_beiying_audio_colors(
+    slots: &[monsgeek_transport::beiying::BeiyingKeySlot],
+    bands: &[f32; NUM_BANDS],
+    style: u8,
+    solid_packed: u32,
+    phase: f32,
+) -> (Vec<(usize, [u8; 3])>, [u8; 3]) {
+    let solid = ((solid_packed & 0x0100_0000) != 0).then_some([
+        ((solid_packed >> 16) & 0xFF) as u8,
+        ((solid_packed >> 8) & 0xFF) as u8,
+        (solid_packed & 0xFF) as u8,
+    ]);
+    let bass = (bands[0] + bands[1] + bands[2] + bands[3]) * 0.25;
+    let mid = bands[4..10].iter().sum::<f32>() / 6.0;
+    let overall = bands.iter().sum::<f32>() / NUM_BANDS as f32;
+
+    let mut frame = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let rgb = match style % 3 {
+            0 => {
+                // Spectrum Columns
+                let band = bands[(slot.col as usize).min(NUM_BANDS - 1)];
+                let key_height = 1.0 - slot.y_norm;
+                let bar = ((band * 1.15 - key_height + 0.25) / 0.25).clamp(0.0, 1.0);
+                let gate = (band / 0.05).clamp(0.0, 1.0);
+                let lit = bar * gate;
+                if lit <= 0.02 {
+                    [0, 0, 0]
+                } else if let Some(c) = solid {
+                    scale_rgb(c, lit)
+                } else {
+                    hsv_to_rgb((slot.x_norm * 300.0 + phase) % 360.0, 1.0, lit)
+                }
+            }
+            1 => {
+                // Vertical Energy Bars
+                let energy = (bass * 0.65 + overall * 0.45).clamp(0.0, 1.0);
+                let key_height = 1.0 - slot.y_norm;
+                let bar = ((energy * 1.15 - key_height + 0.22) / 0.22).clamp(0.0, 1.0);
+                let gate = (energy / 0.05).clamp(0.0, 1.0);
+                let lit = bar * gate;
+                if lit <= 0.02 {
+                    [0, 0, 0]
+                } else if let Some(c) = solid {
+                    scale_rgb(c, lit)
+                } else {
+                    hsv_to_rgb((phase + slot.y_norm * 140.0) % 360.0, 1.0, lit)
+                }
+            }
+            _ => {
+                // Beat Ripple radial wave
+                let dx = slot.x_norm - 0.5;
+                let dy = (slot.y_norm - 0.5) * 0.6;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let wave = (1.0 - (dist * 2.2 - bass * 1.35).abs() * 2.1).clamp(0.0, 1.0);
+                let gate = ((bass + mid) / 0.05).clamp(0.0, 1.0);
+                let val = ((wave * (0.3 + bass * 0.7) + mid * 0.18) * gate).clamp(0.0, 1.0);
+                if val <= 0.02 {
+                    [0, 0, 0]
+                } else if let Some(c) = solid {
+                    scale_rgb(c, val)
+                } else {
+                    hsv_to_rgb((phase * 1.5 + dist * 280.0) % 360.0, 1.0, val)
+                }
+            }
+        };
+        frame.push((slot.slot_index, rgb));
+    }
+
+    let side_val = (bass * 0.7 + overall * 0.3).clamp(0.0, 1.0);
+    let side_rgb = if let Some(c) = solid {
+        scale_rgb(c, side_val)
+    } else {
+        hsv_to_rgb(phase % 360.0, 1.0, side_val)
+    };
+    (frame, side_rgb)
+}
+
+/// Render and stream one audio-reactive per-key frame to a Beiying keyboard.
+pub fn render_beiying_audio_frame(
+    by: &HidBeiyingTransport,
+    bands: &[f32; NUM_BANDS],
+    style: u8,
+    solid_packed: u32,
+    phase: f32,
+) {
+    let (slot_colors, side_rgb) =
+        compute_beiying_audio_colors(by.key_slots(), bands, style, solid_packed, phase);
+    let _ = by.send_per_key_slot_colors(&slot_colors);
+    let _ = by.send_side_lightbar_colors(side_rgb);
+}
+
 /// Visualizer loop — reads spectrum bands from [`AudioState`] and streams them to
-/// the keyboard's on-device music visualizer via `SET_AUDIO_VIZ`.
+/// the keyboard's music visualizer (or Beiying realtime per-key RGB `0x08`).
 pub fn run_viz_loop(
     keyboard: &KeyboardInterface,
     audio_state: &Arc<AudioState>,
@@ -417,6 +547,8 @@ pub fn run_viz_loop(
     let mut frame_count = 0u32;
     let mut rate_count = 0u32;
     let mut rate_start = Instant::now();
+    let mut phase = 0.0f32;
+    let mut last_phase_tick = Instant::now();
 
     // The firmware decodes SET_AUDIO_VIZ differently per connection: USB reads
     // 16 full bytes at payload +8; the dongle/BT (non-USB) path reads nibble-
@@ -431,6 +563,9 @@ pub fn run_viz_loop(
 
     while running.load(Ordering::SeqCst) && audio_state.is_running() {
         let frame_start = Instant::now();
+        let dt = last_phase_tick.elapsed().as_secs_f32().min(0.1);
+        last_phase_tick = Instant::now();
+        phase = (phase + dt * 60.0) % 360.0;
 
         // Diagnostic: measure actual keyboard send rate once per second.
         rate_count += 1;
@@ -442,32 +577,38 @@ pub fn run_viz_loop(
         }
 
         let bands = audio_state.get_bands();
-        let levels = bands_to_viz_levels(&bands);
-        // No-delay send either way — the default 100ms flow-control delay would
-        // cap streaming at ~10Hz; the frame loop does the pacing.
-        if packed {
-            // Dongle/BT: nibble-packed payload, no checksum (it would clobber a band).
-            let payload = audio_viz::pack_bands_nibbles(&levels);
-            let _ = keyboard.transport().send_command_with_delay(
-                cmd::SET_AUDIO_VIZ,
-                &payload,
-                ChecksumType::None,
-                0,
-            );
+        if let Some(by) = keyboard.beiying() {
+            let style = audio_state.beiying_style.load(Ordering::Relaxed);
+            let solid = audio_state.beiying_solid_rgb.load(Ordering::Relaxed);
+            render_beiying_audio_frame(by, &bands, style, solid, phase);
         } else {
-            // USB: 16 full bytes; transport re-frames + checksums it.
-            let report = audio_viz::build_report(&levels);
-            let _ = keyboard.send_raw_cmd_fast(cmd::SET_AUDIO_VIZ, &report[1..24]);
+            let levels = bands_to_viz_levels(&bands);
+            // No-delay send either way — the default 100ms flow-control delay would
+            // cap streaming at ~10Hz; the frame loop does the pacing.
+            if packed {
+                // Dongle/BT: nibble-packed payload, no checksum (it would clobber a band).
+                let payload = audio_viz::pack_bands_nibbles(&levels);
+                let _ = keyboard.transport().send_command_with_delay(
+                    cmd::SET_AUDIO_VIZ,
+                    &payload,
+                    ChecksumType::None,
+                    0,
+                );
+            } else {
+                // USB: 16 full bytes; transport re-frames + checksums it.
+                let report = audio_viz::build_report(&levels);
+                let _ = keyboard.send_raw_cmd_fast(cmd::SET_AUDIO_VIZ, &report[1..24]);
+            }
+
+            if frame_count.is_multiple_of(audio_viz::UPDATE_RATE_HZ * 5)
+                && std::env::var("RUST_LOG").is_ok()
+            {
+                let avg: f32 = bands.iter().sum::<f32>() / NUM_BANDS as f32;
+                eprintln!("[viz] avg={avg:.2} bass={:.2} levels={levels:?}", bands[1]);
+            }
         }
 
-        // Debug output every ~5 seconds (only if RUST_LOG is set)
         frame_count += 1;
-        if frame_count.is_multiple_of(audio_viz::UPDATE_RATE_HZ * 5)
-            && std::env::var("RUST_LOG").is_ok()
-        {
-            let avg: f32 = bands.iter().sum::<f32>() / NUM_BANDS as f32;
-            eprintln!("[viz] avg={avg:.2} bass={:.2} levels={levels:?}", bands[1]);
-        }
 
         let frame_duration = Duration::from_millis(
             1000 / clamp_hz(audio_state.target_hz.load(Ordering::Relaxed)) as u64,
@@ -476,6 +617,10 @@ pub fn run_viz_loop(
         if elapsed < frame_duration {
             thread::sleep(frame_duration - elapsed);
         }
+    }
+
+    if let Some(by) = keyboard.beiying() {
+        let _ = by.clear_realtime_leds();
     }
 }
 
@@ -562,5 +707,29 @@ mod tests {
     fn silence_is_zero() {
         let s = vec![0.0f32; FFT_SIZE * 2];
         assert!(analyze_spectrum(&s, 44100).iter().all(|&b| b == 0.0));
+    }
+
+    #[test]
+    fn beiying_audio_frame_renders_all_styles_and_clears_on_silence() {
+        use monsgeek_transport::beiying::TAC75_SLOTS;
+
+        assert_eq!(hsv_to_rgb(0.0, 1.0, 1.0), [255, 0, 0]);
+        assert_eq!(hsv_to_rgb(120.0, 1.0, 1.0), [0, 255, 0]);
+        assert_eq!(hsv_to_rgb(240.0, 1.0, 1.0), [0, 0, 255]);
+
+        let silent = [0.0f32; NUM_BANDS];
+        for style in 0..=2 {
+            let (frame, side) = compute_beiying_audio_colors(TAC75_SLOTS, &silent, style, 0, 45.0);
+            assert_eq!(frame.len(), TAC75_SLOTS.len());
+            assert!(frame.iter().all(|&(_, rgb)| rgb == [0, 0, 0]));
+            assert_eq!(side, [0, 0, 0]);
+        }
+
+        let hot = [0.85f32; NUM_BANDS];
+        for style in 0..=2 {
+            let (frame, side) = compute_beiying_audio_colors(TAC75_SLOTS, &hot, style, 0, 120.0);
+            assert!(frame.iter().any(|&(_, rgb)| rgb != [0, 0, 0]));
+            assert_ne!(side, [0, 0, 0]);
+        }
     }
 }

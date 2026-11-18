@@ -188,39 +188,64 @@ pub fn open_keyboard(
 ) -> Result<monsgeek_keyboard::KeyboardInterface, Box<dyn std::error::Error>> {
     let flow = open_preferred_transport(ctx)?;
 
-    let info = flow.device_info();
-    let (vid, pid) = (info.vid, info.pid);
-    let device_id = query_device_id(&flow);
-    let db_key_count = iot_driver::devices::key_count_with_id(device_id, vid, pid);
-    let has_magnetism = iot_driver::devices::has_magnetism_with_id(device_id, vid, pid);
-    let device_info = iot_driver::devices::get_device_info_with_id(device_id, vid, pid);
-    let protocol = monsgeek_transport::protocol::ProtocolFamily::detect(
-        device_info.as_ref().map(|d| d.name.as_str()),
-        pid,
-    );
+    let kb = if let Some(by) = flow.as_beiying() {
+        let key_names: Vec<String> = by.key_slots().iter().map(|s| s.name.to_string()).collect();
+        let defaults: Vec<u8> = by.key_slots().iter().map(|s| s.hid_usage).collect();
+        let key_count = by.key_count() as u8;
+        let mut kb = monsgeek_keyboard::KeyboardInterface::new(
+            flow,
+            key_count,
+            true,
+            monsgeek_transport::protocol::ProtocolFamily::Beiying,
+        );
+        kb.set_polling_rates(vec![125, 250, 500, 1000, 2000, 4000, 8000]);
+        kb.set_matrix_key_names(key_names);
+        kb.set_matrix_defaults(defaults);
+        kb
+    } else {
+        let info = flow.device_info();
+        let (vid, pid) = (info.vid, info.pid);
+        let device_id = query_device_id(&flow);
+        let db_key_count = iot_driver::devices::key_count_with_id(device_id, vid, pid);
+        let has_magnetism = iot_driver::devices::has_magnetism_with_id(device_id, vid, pid);
+        let device_info = iot_driver::devices::get_device_info_with_id(device_id, vid, pid);
+        let protocol = monsgeek_transport::protocol::ProtocolFamily::detect(
+            device_info.as_ref().map(|d| d.name.as_str()),
+            pid,
+        );
 
-    let registry = iot_driver::profile_registry();
+        let registry = iot_driver::profile_registry();
 
-    // Try matrix database for key names and matrix size (covers 390+ devices).
-    // This is the generic path — no hardcoded profile needed.
-    let matrix_db = device_id.and_then(|id| registry.get_device_matrix(vid, pid, id));
-    let key_count = iot_driver::device_loader::scan_extent(db_key_count, matrix_db);
+        // Try matrix database for key names and matrix size (covers 390+ devices).
+        // This is the generic path — no hardcoded profile needed.
+        let matrix_db = device_id.and_then(|id| registry.get_device_matrix(vid, pid, id));
+        let key_count = iot_driver::device_loader::scan_extent(db_key_count, matrix_db);
 
-    let mut kb =
-        monsgeek_keyboard::KeyboardInterface::new(flow, key_count, has_magnetism, protocol);
+        let mut kb =
+            monsgeek_keyboard::KeyboardInterface::new(flow, key_count, has_magnetism, protocol);
 
-    // Cap settable polling rates at what this model supports.
-    if let Some(def) = device_id.and_then(|id| registry.get_device_info_by_id_and_usb(id, vid, pid))
-    {
-        kb.set_polling_rates(def.polling_rates().to_vec());
-    }
+        // Cap settable polling rates at what this model supports.
+        if let Some(def) =
+            device_id.and_then(|id| registry.get_device_info_by_id_and_usb(id, vid, pid))
+        {
+            kb.set_polling_rates(def.polling_rates().to_vec());
+        }
 
-    if let Some(names) = registry.resolve_matrix_key_names(device_id, vid, pid) {
-        kb.set_matrix_key_names(names);
-    }
-    if let Some(m) = matrix_db {
-        kb.set_matrix_defaults(m.matrix.clone());
-    }
+        if let Some(names) = registry.resolve_matrix_key_names(device_id, vid, pid) {
+            kb.set_matrix_key_names(names);
+        }
+        if let Some(m) = matrix_db {
+            kb.set_matrix_defaults(m.matrix.clone());
+        }
+
+        // Set non-analog positions from matrix database (encoder/GPIO keys).
+        if let Some(matrix) = matrix_db
+            && let Some(positions) = &matrix.non_analog_positions
+        {
+            kb.set_non_analog_positions(positions.clone());
+        }
+        kb
+    };
 
     // Keymatrix and Fn operations target the board's active profile unless the
     // caller overrides it, so a read and the write that follows always agree.
@@ -236,13 +261,6 @@ pub fn open_keyboard(
         })?,
     };
     kb.set_active_profile(profile);
-
-    // Set non-analog positions from matrix database (encoder/GPIO keys).
-    if let Some(matrix) = matrix_db
-        && let Some(positions) = &matrix.non_analog_positions
-    {
-        kb.set_non_analog_positions(positions.clone());
-    }
 
     Ok(kb)
 }

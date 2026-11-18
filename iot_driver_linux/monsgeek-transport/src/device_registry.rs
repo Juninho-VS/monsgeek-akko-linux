@@ -19,10 +19,15 @@ pub fn register_known_usb_ids(ids: impl IntoIterator<Item = (u16, u16)>) -> bool
     KNOWN_USB_IDS.set(ids.into_iter().collect()).is_ok()
 }
 
-/// Is this a device discovery should look at: any [`VENDOR_ID`] product, or a
-/// VID:PID registered from the device database.
+/// Primary vendor/product IDs for Akko TAC75 HE (`38ee:0016`) BYTech hardware.
+pub const AKKO_BYTECH_VID: u16 = 0x38EE;
+pub const AKKO_TAC75_HE_PID: u16 = 0x0016;
+
+/// Is this a device discovery should look at: any [`VENDOR_ID`] product,
+/// known BYTech TAC75 HE `(0x38EE, 0x0016)`, or a VID:PID registered from the device database.
 pub fn is_candidate_device(vid: u16, pid: u16) -> bool {
     vid == VENDOR_ID
+        || (vid == AKKO_BYTECH_VID && pid == AKKO_TAC75_HE_PID)
         || KNOWN_USB_IDS
             .get()
             .is_some_and(|ids| ids.contains(&(vid, pid)))

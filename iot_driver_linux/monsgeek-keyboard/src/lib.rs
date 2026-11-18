@@ -304,6 +304,64 @@ impl KeyboardInterface {
         &self.transport
     }
 
+    /// Access the Beiying `Report ID 0x09` transport when connected to BYTech hardware.
+    pub fn beiying(&self) -> Option<&monsgeek_transport::beiying::HidBeiyingTransport> {
+        self.transport.as_beiying()
+    }
+
+    /// True when the connected keyboard uses the Shenzhen Beiying (`Report ID 0x09`) protocol.
+    pub fn is_beiying(&self) -> bool {
+        self.beiying().is_some()
+    }
+
+    /// Map a BYTech `LedMode` + brightness/speed/color to canonical `LedParams`.
+    fn led_params_from_beiying(
+        p: monsgeek_transport::beiying::BeiyingLedParams,
+        is_main: bool,
+    ) -> LedParams {
+        let brightness = if is_main {
+            ((p.brightness as u16 + 2) / 5).min(4) as u8
+        } else {
+            p.brightness.min(4)
+        };
+        let direction = if p.color_idx >= 7 {
+            led::DAZZLE_ON
+        } else {
+            led::DAZZLE_OFF
+        };
+        LedParams {
+            mode: LedMode::from_u8(p.effect_id).unwrap_or(LedMode::Constant),
+            brightness,
+            speed: p.speed.min(led::SPEED_MAX),
+            color: RgbColor::new(p.r, p.g, p.b),
+            direction,
+        }
+    }
+
+    /// Convert canonical `LedParams` into BYTech wire fields.
+    fn led_params_to_beiying(
+        params: &LedParams,
+        is_main: bool,
+        existing_dir: u8,
+    ) -> monsgeek_transport::beiying::BeiyingLedParams {
+        let dazzle = (params.direction & 0x0F) == led::DAZZLE_ON;
+        let brightness = if is_main {
+            (params.brightness.min(led::BRIGHTNESS_MAX) * 5).min(20)
+        } else {
+            params.brightness.min(led::BRIGHTNESS_MAX)
+        };
+        monsgeek_transport::beiying::BeiyingLedParams {
+            effect_id: params.mode as u8,
+            color_idx: if dazzle { 7 } else { 0 },
+            r: params.color.r,
+            g: params.color.g,
+            b: params.color.b,
+            brightness,
+            speed: params.speed.min(led::SPEED_MAX),
+            direction: existing_dir,
+        }
+    }
+
     /// How many matrix positions to scan, i.e. one past the highest position the
     /// board uses.
     ///
@@ -335,6 +393,9 @@ impl KeyboardInterface {
 
     /// Get device ID (unique identifier)
     pub fn get_device_id(&self) -> Result<u32, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            return Ok(by.session().synthetic_device_id);
+        }
         let resp = self
             .transport
             .query_command(cmd::GET_USB_VERSION, &[], ChecksumType::Bit7)?;
@@ -351,6 +412,9 @@ impl KeyboardInterface {
 
     /// Get firmware version
     pub fn get_version(&self) -> Result<FirmwareVersion, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            return Ok(FirmwareVersion::new(by.session().fw_version));
+        }
         // Use GET_USB_VERSION which returns device_id and version
         let resp = self
             .transport
@@ -386,6 +450,9 @@ impl KeyboardInterface {
 
     /// Get current LED parameters
     pub fn get_led_params(&self) -> Result<LedParams, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            return Ok(Self::led_params_from_beiying(by.get_main_led()?, true));
+        }
         let resp: TransportLedParamsResponse = self.transport.query(&QueryLedParams::default())?;
         Ok(LedParams::from_transport_response(&resp))
     }
@@ -399,6 +466,15 @@ impl KeyboardInterface {
 
     /// Set LED parameters
     pub fn set_led_params(&self, params: &LedParams) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            if (20..=22).contains(&(params.mode as u8)) {
+                return Ok(());
+            }
+            let _ = by.clear_realtime_leds();
+            let dir = by.get_main_led().map(|p| p.direction).unwrap_or(0);
+            by.set_main_led(Self::led_params_to_beiying(params, true, dir))?;
+            return Ok(());
+        }
         self.transport.send(&params.to_transport_cmd())?;
         Ok(())
     }
@@ -407,6 +483,10 @@ impl KeyboardInterface {
 
     /// Get the profile the keyboard is currently switched to.
     pub fn get_profile(&self) -> Result<Profile, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let p = by.get_profile()?;
+            return Profile::try_from(p).map_err(KeyboardError::InvalidParameter);
+        }
         let cmd = self.commands.get_profile;
         let resp = self.transport.query_command(cmd, &[], ChecksumType::Bit7)?;
         if resp.is_empty() || resp[0] != cmd {
@@ -419,6 +499,10 @@ impl KeyboardInterface {
 
     /// Switch the keyboard to a profile.
     pub fn set_profile(&self, profile: Profile) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            by.set_profile(profile.get())?;
+            return Ok(());
+        }
         self.transport.send_command(
             self.commands.set_profile,
             &[profile.get()],
@@ -429,6 +513,12 @@ impl KeyboardInterface {
 
     /// Get polling rate (RY5088-only, uses GET_REPORT)
     pub fn get_polling_rate(&self) -> Result<PollingRate, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let hz = by.get_polling_rate_hz()?;
+            return PollingRate::from_hz(hz).ok_or_else(|| {
+                KeyboardError::UnexpectedResponse(format!("Unknown polling rate: {hz} Hz"))
+            });
+        }
         let cmd_byte = self.commands.get_report.ok_or_else(|| {
             KeyboardError::NotSupported("Polling rate not available on this device".into())
         })?;
@@ -448,6 +538,17 @@ impl KeyboardInterface {
 
     /// Set polling rate (RY5088-only, uses SET_REPORT)
     pub fn set_polling_rate(&self, rate: PollingRate) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let hz = rate.to_hz();
+            if !self.polling_rates.is_empty() && !self.polling_rates.contains(&hz) {
+                let max = self.polling_rates.iter().max().copied().unwrap_or(0);
+                return Err(KeyboardError::NotSupported(format!(
+                    "{hz} Hz is above this device's maximum of {max} Hz"
+                )));
+            }
+            by.set_polling_rate_hz(hz)?;
+            return Ok(());
+        }
         let cmd_byte = self.commands.set_report.ok_or_else(|| {
             KeyboardError::NotSupported("Polling rate not available on this device".into())
         })?;
@@ -468,6 +569,9 @@ impl KeyboardInterface {
 
     /// Get debounce time in milliseconds
     pub fn get_debounce(&self) -> Result<u8, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            return Ok(by.get_debounce_ms()?.min(u8::MAX as u16) as u8);
+        }
         let cmd_byte = self.commands.get_debounce;
         let resp = self
             .transport
@@ -487,6 +591,10 @@ impl KeyboardInterface {
                 "Debounce must be 0-50ms".into(),
             ));
         }
+        if let Some(by) = self.beiying() {
+            by.set_debounce_ms(ms as u16)?;
+            return Ok(());
+        }
         self.transport
             .send_command(self.commands.set_debounce, &[ms], ChecksumType::Bit7)?;
         Ok(())
@@ -499,6 +607,10 @@ impl KeyboardInterface {
     /// Returns idle and deep sleep timeouts for both Bluetooth and 2.4GHz.
     /// All values are in seconds.
     pub fn get_sleep_time(&self) -> Result<SleepTimeSettings, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let secs = by.get_sleep_seconds()?;
+            return Ok(SleepTimeSettings::uniform(secs, secs));
+        }
         let cmd_byte = self.commands.get_sleeptime.ok_or_else(|| {
             KeyboardError::NotSupported("Sleep time not available on this device".into())
         })?;
@@ -523,6 +635,11 @@ impl KeyboardInterface {
     /// Sets idle and deep sleep timeouts for both Bluetooth and 2.4GHz.
     /// All values are in seconds. Set to 0 to disable a particular timeout.
     pub fn set_sleep_time(&self, settings: &SleepTimeSettings) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let secs = settings.idle_24g.max(settings.idle_bt);
+            by.set_sleep_seconds(secs)?;
+            return Ok(());
+        }
         let cmd_byte = self.commands.set_sleeptime.ok_or_else(|| {
             KeyboardError::NotSupported("Sleep time not available on this device".into())
         })?;
@@ -541,6 +658,16 @@ impl KeyboardInterface {
 
     /// Get keyboard options (OS mode, Fn layer, etc.)
     pub fn get_kb_options(&self) -> Result<KeyboardOptions, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let o = by.get_kb_options()?;
+            return Ok(KeyboardOptions {
+                os_mode: o.os_mode,
+                fn_layer: 0,
+                anti_mistouch: false,
+                rt_stability: 0,
+                wasd_swap: o.wasd_swap,
+            });
+        }
         let cmd_byte = self.commands.get_kboption.ok_or_else(|| {
             KeyboardError::NotSupported("KB options not available on this device".into())
         })?;
@@ -559,6 +686,13 @@ impl KeyboardInterface {
 
     /// Set keyboard options
     pub fn set_kb_options(&self, options: &KeyboardOptions) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let mut cur = by.get_kb_options().unwrap_or_default();
+            cur.os_mode = options.os_mode;
+            cur.wasd_swap = options.wasd_swap;
+            by.set_kb_options(cur)?;
+            return Ok(());
+        }
         let cmd_byte = self.commands.set_kboption.ok_or_else(|| {
             KeyboardError::NotSupported("KB options not available on this device".into())
         })?;
@@ -594,6 +728,14 @@ impl KeyboardInterface {
     /// This is the recommended way to get precision - consumers should use this
     /// instead of calling get_feature_list() or get_version() directly for precision.
     pub fn get_precision(&self) -> Result<settings::Precision, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            return Ok(match by.um_per_unit() {
+                1 => settings::Precision::UltraFine,
+                5 => settings::Precision::Fine,
+                10 => settings::Precision::Medium,
+                _ => settings::Precision::Coarse,
+            });
+        }
         // Try feature list first
         if let Ok(features) = self.get_feature_list()
             && let Some(precision) = features.precision()
@@ -610,6 +752,14 @@ impl KeyboardInterface {
 
     /// Get side LED parameters
     pub fn get_side_led_params(&self) -> Result<LedParams, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            if !by.session().side_light_available {
+                return Err(KeyboardError::NotSupported(
+                    "Side LED not available on this Beiying device".into(),
+                ));
+            }
+            return Ok(Self::led_params_from_beiying(by.get_side_led()?, false));
+        }
         let resp = self
             .transport
             .query_command(cmd::GET_SLEDPARAM, &[], ChecksumType::Bit7)?;
@@ -633,6 +783,15 @@ impl KeyboardInterface {
 
     /// Set side LED parameters
     pub fn set_side_led_params(&self, params: &LedParams) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            if !by.session().side_light_available {
+                return Err(KeyboardError::NotSupported(
+                    "Side LED not available on this Beiying device".into(),
+                ));
+            }
+            by.set_side_led(Self::led_params_to_beiying(params, false, 0))?;
+            return Ok(());
+        }
         // Protocol format: [mode, speed, brightness, option, r, g, b]
         // Note: Side LED speed is NOT inverted (unlike main LED)
         let data = [
@@ -739,6 +898,10 @@ impl KeyboardInterface {
                 "Device does not have Hall Effect switches".into(),
             ));
         }
+        if let Some(by) = self.beiying() {
+            by.start_travel_monitoring()?;
+            return Ok(());
+        }
         self.transport.send(&SetMagnetismReport::enable())?;
         Ok(())
     }
@@ -746,6 +909,10 @@ impl KeyboardInterface {
     /// Stop magnetism (key depth) reporting
     pub fn stop_magnetism_report(&self) -> Result<(), KeyboardError> {
         if !self.has_magnetism {
+            return Ok(());
+        }
+        if let Some(by) = self.beiying() {
+            by.stop_travel_monitoring()?;
             return Ok(());
         }
         self.transport.send(&SetMagnetismReport::disable())?;
@@ -804,6 +971,26 @@ impl KeyboardInterface {
                 "Device does not have Hall Effect switches".into(),
             ));
         }
+        if let Some(by) = self.beiying() {
+            let key_id = by
+                .slot_to_key_id(settings.key_index as usize)
+                .ok_or_else(|| {
+                    KeyboardError::InvalidParameter(format!(
+                        "key_index {} out of range for Beiying",
+                        settings.key_index
+                    ))
+                })?;
+            let unit = by.um_per_unit();
+            let act_um = settings.actuation.saturating_mul(unit);
+            by.set_key_travels_um(0, &[(key_id, act_um)])?;
+            let mut rts = by.get_all_rapid_triggers(0)?;
+            if let Some(entry) = rts.iter_mut().find(|e| e.key_id == key_id) {
+                entry.enabled = settings.rapid_trigger;
+                let single = [*entry];
+                by.set_rapid_triggers(0, &single)?;
+            }
+            return Ok(());
+        }
 
         let key = settings.key_index;
         self.set_magnetism_simple(
@@ -855,6 +1042,41 @@ impl KeyboardInterface {
             return Err(KeyboardError::NotSupported(
                 "Device does not have Hall Effect switches".into(),
             ));
+        }
+        if let Some(by) = self.beiying() {
+            let kc = by.key_count();
+            let unit = by.um_per_unit().max(1);
+            let travels = by.get_all_key_travels_um(0)?;
+            let rts = by.get_all_rapid_triggers(0)?;
+            let dzs = by.get_all_deadzones().unwrap_or_default();
+
+            let rt_map: std::collections::HashMap<
+                u16,
+                monsgeek_transport::beiying::BeiyingRtEntry,
+            > = rts.into_iter().map(|e| (e.key_id, e)).collect();
+            let dz_map: std::collections::HashMap<
+                u16,
+                monsgeek_transport::beiying::BeiyingDeadzoneEntry,
+            > = dzs.into_iter().map(|e| (e.key_id, e)).collect();
+
+            let mut out = TriggerSettings::new(kc);
+            for (idx, slot) in by.key_slots().iter().enumerate() {
+                let t = travels.get(&slot.key_id).copied().unwrap_or(2000) / unit;
+                out.press_travel[idx] = t;
+                out.lift_travel[idx] = t;
+                if let Some(rt) = rt_map.get(&slot.key_id) {
+                    out.rt_press[idx] = rt.press_um / unit;
+                    out.rt_lift[idx] = rt.release_um / unit;
+                    out.key_modes[idx] = ModeByte::new(KeyMode::Normal, rt.enabled).to_u8();
+                } else {
+                    out.key_modes[idx] = ModeByte::new(KeyMode::Normal, false).to_u8();
+                }
+                if let Some(dz) = dz_map.get(&slot.key_id) {
+                    out.top_deadzone[idx] = dz.top_um / unit;
+                    out.bottom_deadzone[idx] = dz.bottom_um / unit;
+                }
+            }
+            return Ok(out);
         }
 
         // Calculate pages needed based on key count (64 bytes per page)
@@ -934,24 +1156,51 @@ impl KeyboardInterface {
 
     /// Set the actuation point for all keys.
     pub fn set_actuation_all(&self, travel: TravelDepth) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let um = travel.raw().saturating_mul(by.um_per_unit());
+            let entries: Vec<(u16, u16)> = by.key_slots().iter().map(|s| (s.key_id, um)).collect();
+            by.set_key_travels_um(0, &entries)?;
+            return Ok(());
+        }
         let values = vec![travel.raw(); self.key_count as usize];
         self.set_magnetism_u16(mag_cmd::PRESS_TRAVEL, &values)
     }
 
     /// Set the release point for all keys.
     pub fn set_release_all(&self, travel: TravelDepth) -> Result<(), KeyboardError> {
+        if self.is_beiying() {
+            return Ok(());
+        }
         let values = vec![travel.raw(); self.key_count as usize];
         self.set_magnetism_u16(mag_cmd::LIFT_TRAVEL, &values)
     }
 
     /// Set Rapid Trigger press sensitivity for all keys.
     pub fn set_rt_press_all(&self, travel: TravelDepth) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let um = travel.raw().saturating_mul(by.um_per_unit());
+            let mut entries = by.get_all_rapid_triggers(0)?;
+            for e in &mut entries {
+                e.press_um = um;
+            }
+            by.set_rapid_triggers(0, &entries)?;
+            return Ok(());
+        }
         let values = vec![travel.raw(); self.key_count as usize];
         self.set_magnetism_u16(mag_cmd::RT_PRESS, &values)
     }
 
     /// Set Rapid Trigger release sensitivity for all keys.
     pub fn set_rt_lift_all(&self, travel: TravelDepth) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let um = travel.raw().saturating_mul(by.um_per_unit());
+            let mut entries = by.get_all_rapid_triggers(0)?;
+            for e in &mut entries {
+                e.release_um = um;
+            }
+            by.set_rapid_triggers(0, &entries)?;
+            return Ok(());
+        }
         let values = vec![travel.raw(); self.key_count as usize];
         self.set_magnetism_u16(mag_cmd::RT_LIFT, &values)
     }
@@ -959,6 +1208,14 @@ impl KeyboardInterface {
     /// Enable/disable the Rapid-Trigger flag (`0x80`) for all keys, preserving
     /// each key's base mode (read-modify-write of the KEY_MODE bytes).
     pub fn set_rapid_trigger_all(&self, enable: bool) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let mut entries = by.get_all_rapid_triggers(0)?;
+            for e in &mut entries {
+                e.enabled = enable;
+            }
+            by.set_rapid_triggers(0, &entries)?;
+            return Ok(());
+        }
         let kc = self.key_count as usize;
         let mut modes = self.get_magnetism(mag_cmd::KEY_MODE, kc.div_ceil(64))?;
         modes.resize(kc, 0);
@@ -974,6 +1231,14 @@ impl KeyboardInterface {
 
     /// Set the base mode (`0x80` RT flag cleared) for all keys.
     pub fn set_mode_all(&self, mode: ModeByte) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let mut entries = by.get_all_rapid_triggers(0)?;
+            for e in &mut entries {
+                e.enabled = mode.rapid_trigger;
+            }
+            by.set_rapid_triggers(0, &entries)?;
+            return Ok(());
+        }
         let values = vec![mode.to_u8(); self.key_count as usize];
         self.set_magnetism_u8(mag_cmd::KEY_MODE, &values)
     }
@@ -1007,11 +1272,21 @@ impl KeyboardInterface {
 
     /// Read the 512-byte DKS trigger-modes blob (GET subcmd 0x0A, 8 pages).
     pub fn get_dks_trigger_modes_blob(&self) -> Result<Vec<u8>, KeyboardError> {
+        if self.is_beiying() {
+            return Err(KeyboardError::NotSupported(
+                "DKS blob not available on Beiying".into(),
+            ));
+        }
         self.get_magnetism(mag_cmd::DKS_MODES, 8)
     }
 
     /// Read per-key DKS activation travel values (GET subcmd 0x04, u16 LE per key).
     pub fn get_dks_travels(&self) -> Result<Vec<u16>, KeyboardError> {
+        if self.is_beiying() {
+            return Err(KeyboardError::NotSupported(
+                "DKS travels not available on Beiying".into(),
+            ));
+        }
         let kc = self.key_count as usize;
         let raw = self.get_magnetism(mag_cmd::DKS_TRAVEL, kc.div_ceil(32))?;
         Ok(raw
@@ -1101,6 +1376,21 @@ impl KeyboardInterface {
         config: [u8; 4],
         commit: bool,
     ) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let key_id = by.slot_to_key_id(key_index as usize).ok_or_else(|| {
+                KeyboardError::InvalidParameter(format!(
+                    "key_index {key_index} out of range for Beiying"
+                ))
+            })?;
+            let by_layer = match layer.get() {
+                0 => 0,
+                1 => 2,
+                _ => return Ok(()),
+            };
+            let kc = monsgeek_transport::beiying::config_to_bytech_keycode(config);
+            by.set_keymaps(by_layer, &[(key_id, kc)])?;
+            return Ok(());
+        }
         let pkt = SetKeyMatrixData::new(profile.get(), key_index, layer.get(), commit, config)?;
         if commit {
             self.transport.send_command_with_delay(
@@ -1168,6 +1458,9 @@ impl KeyboardInterface {
     /// Note: only the timing lives in the magnetism protocol; the tap/hold
     /// keycodes are configured through the normal keymap for that key.
     pub fn get_modtap_times(&self) -> Result<Vec<u16>, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            return Ok(vec![0; by.key_count()]);
+        }
         let kc = self.key_count as usize;
         let raw = self.get_magnetism(mag_cmd::MODTAP_TIME, kc.div_ceil(64))?;
         Ok(raw
@@ -1180,6 +1473,11 @@ impl KeyboardInterface {
     /// Set the Mod-Tap decision time (ms, rounded to the 10 ms wire step) for a
     /// single key.
     pub fn set_modtap_time(&self, key_index: u8, ms: u16) -> Result<(), KeyboardError> {
+        if self.is_beiying() {
+            return Err(KeyboardError::NotSupported(
+                "Mod-Tap on Beiying requires captured packet format".into(),
+            ));
+        }
         let steps = (ms / MODTAP_TIME_STEP_MS).min(u8::MAX as u16) as u8;
         self.set_magnetism_simple(mag_cmd::MODTAP_TIME, key_index, true, &[steps])
     }
@@ -1189,6 +1487,9 @@ impl KeyboardInterface {
     /// Read each key's Snap-Tap partner index. `SNAPTAP_UNBOUND` means the key
     /// is not part of a pair.
     pub fn get_snaptap_binds(&self) -> Result<Vec<u8>, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            return Ok(vec![SNAPTAP_UNBOUND; by.key_count()]);
+        }
         let kc = self.key_count as usize;
         let mut raw = self.get_magnetism(mag_cmd::SNAPTAP_ENABLE, kc.div_ceil(64))?;
         raw.truncate(kc);
@@ -1198,6 +1499,11 @@ impl KeyboardInterface {
     /// Bind two keys as a Snap-Tap (SOCD) pair. The binding is bidirectional, so
     /// both directions are written (matching the vendor app).
     pub fn set_snaptap_pair(&self, key_a: u8, key_b: u8) -> Result<(), KeyboardError> {
+        if self.is_beiying() {
+            return Err(KeyboardError::NotSupported(
+                "Snap-Tap on Beiying requires captured packet format".into(),
+            ));
+        }
         self.set_magnetism_simple(mag_cmd::SNAPTAP_ENABLE, key_a, false, &[key_b])?;
         self.set_magnetism_simple(mag_cmd::SNAPTAP_ENABLE, key_b, true, &[key_a])
     }
@@ -1205,6 +1511,12 @@ impl KeyboardInterface {
     /// Clear a key's Snap-Tap binding, also clearing its partner's
     /// back-reference so the pair is fully dissolved.
     pub fn clear_snaptap(&self, key_index: u8) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            if let Some(id) = by.slot_to_key_id(key_index as usize) {
+                by.clear_advanced_key(0, id)?;
+            }
+            return Ok(());
+        }
         let binds = self.get_snaptap_binds()?;
         let partner = binds
             .get(key_index as usize)
@@ -1227,6 +1539,16 @@ impl KeyboardInterface {
     /// Set the bottom deadzone for all keys — the distance from the bottom of
     /// travel that is ignored.
     pub fn set_bottom_deadzone_all(&self, travel: TravelDepth) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let um = travel.raw().saturating_mul(by.um_per_unit());
+            let mut entries = by.get_all_deadzones()?;
+            for e in &mut entries {
+                e.bottom_um = um;
+                e.enabled = true;
+            }
+            by.set_deadzones(&entries)?;
+            return Ok(());
+        }
         let values = vec![travel.raw(); self.key_count as usize];
         self.set_magnetism_u16(mag_cmd::BOTTOM_DEADZONE, &values)
     }
@@ -1234,6 +1556,16 @@ impl KeyboardInterface {
     /// Set the top deadzone for all keys — the distance from the top of travel
     /// that is ignored.
     pub fn set_top_deadzone_all(&self, travel: TravelDepth) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let um = travel.raw().saturating_mul(by.um_per_unit());
+            let mut entries = by.get_all_deadzones()?;
+            for e in &mut entries {
+                e.top_um = um;
+                e.enabled = true;
+            }
+            by.set_deadzones(&entries)?;
+            return Ok(());
+        }
         let values = vec![travel.raw(); self.key_count as usize];
         self.set_magnetism_u16(mag_cmd::TOP_DEADZONE, &values)
     }
@@ -1279,6 +1611,25 @@ impl KeyboardInterface {
         dazzle: bool,
         userpic_slot: u8,
     ) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            if (20..=22).contains(&mode) {
+                return Ok(());
+            }
+            let _ = by.clear_realtime_leds();
+            let dir = by.get_main_led().map(|p| p.direction).unwrap_or(0);
+            by.set_main_led(monsgeek_transport::beiying::BeiyingLedParams {
+                effect_id: mode,
+                color_idx: if dazzle { 7 } else { 0 },
+                r,
+                g,
+                b,
+                brightness: (brightness.min(led::BRIGHTNESS_MAX) * 5).min(20),
+                speed: speed.min(led::SPEED_MAX),
+                direction: dir,
+            })?;
+            return Ok(());
+        }
+
         let (option, r_val, g_val, b_val) = if mode == 13 {
             // For UserPicture mode: option = slot << 4, RGB = (0, 200, 200)
             (userpic_slot << 4, 0u8, 200u8, 200u8)
@@ -1326,6 +1677,9 @@ impl KeyboardInterface {
         brightness: u8,
         color: Option<(u8, u8, u8)>,
     ) -> Result<(), KeyboardError> {
+        if self.is_beiying() {
+            return Ok(());
+        }
         let (low, r, g, b) = match color {
             Some((r, g, b)) => (4u8, r, g, b),  // solid custom color
             None => (led::DAZZLE_OFF, 0, 0, 0), // built-in rainbow cycle
@@ -1356,6 +1710,15 @@ impl KeyboardInterface {
         repeat: u8,
         led_layer: u8,
     ) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let slots: Vec<(usize, [u8; 3])> = colors
+                .iter()
+                .enumerate()
+                .map(|(i, &(r, g, b))| (i, [r, g, b]))
+                .collect();
+            by.send_per_key_slot_colors(&slots)?;
+            return Ok(());
+        }
         const CHUNK_SIZE: usize = 18; // 18 keys per chunk (54 bytes RGB)
 
         // Pad colors to full matrix size
@@ -1400,6 +1763,9 @@ impl KeyboardInterface {
 
     /// Start/stop minimum position calibration (keys released)
     pub fn calibrate_min(&self, start: bool) -> Result<(), KeyboardError> {
+        if self.is_beiying() {
+            return Ok(());
+        }
         self.transport.send_command(
             cmd::SET_MAGNETISM_CAL,
             &[if start { 1 } else { 0 }],
@@ -1410,6 +1776,10 @@ impl KeyboardInterface {
 
     /// Start/stop maximum position calibration (keys pressed)
     pub fn calibrate_max(&self, start: bool) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            by.set_calibration_mode(start)?;
+            return Ok(());
+        }
         self.transport.send_command(
             cmd::SET_MAGNETISM_MAX_CAL,
             &[if start { 1 } else { 0 }],
@@ -1429,6 +1799,9 @@ impl KeyboardInterface {
     /// # Returns
     /// Vector of 16-bit calibration values for up to 32 keys
     pub fn get_calibration_progress(&self, page: u8) -> Result<Vec<u16>, KeyboardError> {
+        if self.is_beiying() {
+            return Ok(vec![300; 32]);
+        }
         let query = GetMultiMagnetismData::paged(mag_cmd::CALIBRATION, page);
         let response = self.transport.query_raw(
             cmd::GET_MULTI_MAGNETISM,
@@ -1450,6 +1823,10 @@ impl KeyboardInterface {
 
     /// Factory reset the keyboard
     pub fn reset(&self) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            by.reset(monsgeek_transport::beiying::BeiyingResetTarget::Full)?;
+            return Ok(());
+        }
         self.transport
             .send_command(self.commands.set_reset, &[], ChecksumType::Bit7)?;
         Ok(())
@@ -1518,6 +1895,34 @@ impl KeyboardInterface {
         layer: KeymatrixLayer,
         num_pages: usize,
     ) -> Result<Vec<u8>, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let kc = by.key_count();
+            let slots = by.key_slots();
+            let by_layer = match layer.get() {
+                0 => Some(0u8),
+                1 => Some(2u8),
+                _ => None,
+            };
+            let mut out = vec![0u8; kc * 4];
+            if let Some(bl) = by_layer {
+                let map = by.get_keymaps(bl)?;
+                for (i, slot) in slots.iter().enumerate() {
+                    let k = map.get(&slot.key_id).copied().unwrap_or(0);
+                    let cfg = if bl == 0 && k == 0 {
+                        if slot.key_id == 0x48 {
+                            [10, 1, 0, 0]
+                        } else {
+                            [0, 0, slot.hid_usage, 0]
+                        }
+                    } else {
+                        monsgeek_transport::beiying::bytech_keycode_to_config(k)
+                    };
+                    out[i * 4..i * 4 + 4].copy_from_slice(&cfg);
+                }
+            }
+            return Ok(out);
+        }
+
         let mut all_data = Vec::new();
 
         for page in 0..num_pages {
@@ -1566,6 +1971,18 @@ impl KeyboardInterface {
         sys: u8,
         num_pages: usize,
     ) -> Result<Vec<u8>, KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let map = by.get_keymaps(1)?;
+            let mut out = vec![0u8; by.key_count() * 4];
+            for (i, slot) in by.key_slots().iter().enumerate() {
+                if let Some(&k) = map.get(&slot.key_id) {
+                    let cfg = monsgeek_transport::beiying::bytech_keycode_to_config(k);
+                    out[i * 4..i * 4 + 4].copy_from_slice(&cfg);
+                }
+            }
+            return Ok(out);
+        }
+
         let mut all_data = Vec::new();
 
         for page in 0..num_pages {
@@ -1604,6 +2021,16 @@ impl KeyboardInterface {
         key_index: u8,
         config: [u8; 4],
     ) -> Result<(), KeyboardError> {
+        if let Some(by) = self.beiying() {
+            let key_id = by.slot_to_key_id(key_index as usize).ok_or_else(|| {
+                KeyboardError::InvalidParameter(format!(
+                    "key_index {key_index} out of range for Beiying"
+                ))
+            })?;
+            let kc = monsgeek_transport::beiying::config_to_bytech_keycode(config);
+            by.set_keymaps(1, &[(key_id, kc)])?;
+            return Ok(());
+        }
         self.transport
             .send(&SetFnData::new(0, profile.get(), key_index, config)?)?;
         Ok(())
@@ -1621,6 +2048,15 @@ impl KeyboardInterface {
         enabled: bool,
         layer: KeymatrixLayer,
     ) -> Result<(), KeyboardError> {
+        if self.is_beiying() {
+            return self.set_keymatrix_config(
+                profile,
+                key_index,
+                layer,
+                [0, 0, hid_code, 0],
+                enabled,
+            );
+        }
         let pkt = SetKeyMatrixData::new(
             profile.get(),
             key_index,
@@ -2115,6 +2551,9 @@ impl KeyboardInterface {
     /// `None` if it's running stock firmware (response doesn't contain the
     /// expected magic bytes).
     pub fn get_patch_info(&self) -> Result<Option<PatchInfo>, KeyboardError> {
+        if self.is_beiying() {
+            return Ok(None);
+        }
         let resp = self
             .transport
             .query_raw(cmd::GET_PATCH_INFO, &[], ChecksumType::Bit7)?;
@@ -2147,6 +2586,9 @@ impl KeyboardInterface {
     /// Returns `Some(PatchInfo)` if the dongle is running patched firmware,
     /// `None` if it's stock or the transport doesn't support it (wired/BLE).
     pub fn get_dongle_patch_info(&self) -> Result<Option<PatchInfo>, KeyboardError> {
+        if self.is_beiying() {
+            return Ok(None);
+        }
         let Some(buf) = self.transport.inner().get_dongle_patch_info()? else {
             return Ok(None);
         };

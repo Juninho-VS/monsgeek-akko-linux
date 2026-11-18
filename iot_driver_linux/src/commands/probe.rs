@@ -256,7 +256,11 @@ fn section_target(out: &mut String, ctx: &CmdCtx) {
 
     let db_info =
         iot_driver::devices::get_device_info_with_id(device_id.map(|v| v as i32), vid, pid);
-    let family = ProtocolFamily::detect(db_info.as_ref().map(|d| d.name.as_str()), pid);
+    let family = if transport.as_beiying().is_some() {
+        ProtocolFamily::Beiying
+    } else {
+        ProtocolFamily::detect(db_info.as_ref().map(|d| d.name.as_str()), pid)
+    };
     let _ = writeln!(out, "- protocol family: {family}");
 
     // Raw protocol capability dump (for reverse engineering unknown devices).

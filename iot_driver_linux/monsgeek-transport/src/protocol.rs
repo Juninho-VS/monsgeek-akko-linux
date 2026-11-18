@@ -912,6 +912,8 @@ pub enum ProtocolFamily {
     #[default]
     Ry5088,
     YiChip,
+    /// Shenzhen Beiying / BYTech (`Report ID 0x09`, e.g. Akko TAC75 HE `38ee:0016`)
+    Beiying,
 }
 
 /// Command byte mapping table for a protocol family.
@@ -987,6 +989,7 @@ impl ProtocolFamily {
         match self {
             ProtocolFamily::Ry5088 => &RY5088_COMMANDS,
             ProtocolFamily::YiChip => &YICHIP_COMMANDS,
+            ProtocolFamily::Beiying => &RY5088_COMMANDS,
         }
     }
 
@@ -1023,6 +1026,7 @@ impl fmt::Display for ProtocolFamily {
         match self {
             ProtocolFamily::Ry5088 => f.write_str("RY5088"),
             ProtocolFamily::YiChip => f.write_str("YiChip"),
+            ProtocolFamily::Beiying => f.write_str("Beiying (Report 0x09)"),
         }
     }
 }

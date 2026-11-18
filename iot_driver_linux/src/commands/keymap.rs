@@ -13,7 +13,7 @@ use monsgeek_transport::protocol::{KeymatrixLayer, Profile};
 /// `from` can include a layer prefix: `"Fn+Caps"`, `"L1+A"`, `"42"`.
 /// When a layer prefix is present, it takes precedence over the `--layer` flag.
 pub fn remap(keyboard: &KeyboardInterface, from: &str, to: &str, layer: Layer) -> CommandResult {
-    let key_ref: KeyRef = match from.parse() {
+    let key_ref: KeyRef = match keymap::resolve_key_ref(keyboard, from) {
         Ok(kr) => kr,
         Err(msg) => {
             eprintln!("{msg}");
@@ -55,7 +55,7 @@ pub fn remap(keyboard: &KeyboardInterface, from: &str, to: &str, layer: Layer) -
 ///
 /// `key` can include a layer prefix: `"Fn+Caps"`, `"L1+A"`.
 pub fn reset_key(keyboard: &KeyboardInterface, key: &str, layer: Layer) -> CommandResult {
-    let key_ref: KeyRef = match key.parse() {
+    let key_ref: KeyRef = match keymap::resolve_key_ref(keyboard, key) {
         Ok(kr) => kr,
         Err(msg) => {
             eprintln!("{msg}");
@@ -93,14 +93,14 @@ pub fn swap(
     key2: &str,
     profile: Profile,
 ) -> CommandResult {
-    let kr_a: KeyRef = match key1.parse() {
+    let kr_a: KeyRef = match keymap::resolve_key_ref(keyboard, key1) {
         Ok(kr) => kr,
         Err(msg) => {
             eprintln!("{msg}");
             return Ok(());
         }
     };
-    let kr_b: KeyRef = match key2.parse() {
+    let kr_b: KeyRef = match keymap::resolve_key_ref(keyboard, key2) {
         Ok(kr) => kr,
         Err(msg) => {
             eprintln!("{msg}");

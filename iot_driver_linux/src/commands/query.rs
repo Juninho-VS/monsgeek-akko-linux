@@ -24,6 +24,38 @@ pub fn info(ctx: &CmdCtx) -> CommandResult {
         dev.vid, dev.pid, dev.transport_type
     );
 
+    if let Some(by) = transport.as_beiying() {
+        let s = by.session();
+        println!(
+            "Firmware:  {} (raw 0x{:04X}, dec {})",
+            FirmwareVersion::new(s.fw_version).format(),
+            s.fw_version,
+            s.fw_version
+        );
+        println!(
+            "Device ID: {} (0x{:08X}, UUID 0x{})",
+            s.synthetic_device_id, s.synthetic_device_id, s.uuid_hex
+        );
+        println!(
+            "Protocol:  {}",
+            monsgeek_transport::protocol::ProtocolFamily::Beiying
+        );
+        println!("Keys:      {} (Hall Effect)", by.key_count());
+        println!(
+            "Precision: {} µm (min RT {} µm), {} profiles",
+            s.precision_um, s.min_rt_um, s.profile_count
+        );
+        println!(
+            "LED Caps:  flags=0x{:04X}, music={}, side_light={} ({} LEDs), logo={}",
+            s.led_proto_flags,
+            s.music_supported,
+            s.side_light_available,
+            s.side_light_count,
+            s.logo_light_available
+        );
+        return Ok(());
+    }
+
     let resp = transport.query_command(transport_cmd::GET_USB_VERSION, &[], ChecksumType::Bit7)?;
     let device_id = u32::from_le_bytes([resp[1], resp[2], resp[3], resp[4]]);
     let version = u16::from_le_bytes([resp[7], resp[8]]);

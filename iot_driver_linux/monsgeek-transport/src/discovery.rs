@@ -202,13 +202,17 @@ impl DeviceDiscovery for HidDiscovery {
 
             // Determine transport type based on bus type and PID
             let is_bluetooth = is_bluetooth_bus(device_info);
+            let path = device_info.path().to_string_lossy().to_string();
+            let is_beiying =
+                !is_bluetooth && crate::beiying::is_beiying_hidraw_device(&path).is_some();
 
             // For Bluetooth: look for vendor interface (usage 0x0202, page 0xFF55)
-            // For USB: look for feature interface (vendor usage page, usage 0x02)
+            // For USB: look for feature interface (vendor usage page, usage 0x02),
+            // or a verified Beiying Report ID 0x09 vendor interface.
             let is_target_interface = if is_bluetooth {
                 Self::is_bluetooth_vendor_interface(device_info)
             } else {
-                Self::is_usb_feature_interface(device_info)
+                is_beiying || Self::is_usb_feature_interface(device_info)
             };
 
             if !is_target_interface {
@@ -218,10 +222,11 @@ impl DeviceDiscovery for HidDiscovery {
             // Authoritative PID list first; fall back to a product-string
             // heuristic so dongles with an unrecognized PID are still treated
             // as receivers (and surfaced by `probe`) instead of wired.
-            let is_dongle = device_registry::is_dongle_pid(pid)
-                || (!is_bluetooth
-                    && !device_registry::is_bluetooth_pid(pid)
-                    && device_registry::looks_like_dongle(device_info.product_string()));
+            let is_dongle = !is_beiying
+                && (device_registry::is_dongle_pid(pid)
+                    || (!is_bluetooth
+                        && !device_registry::is_bluetooth_pid(pid)
+                        && device_registry::looks_like_dongle(device_info.product_string())));
             let transport_type = if is_bluetooth {
                 TransportType::Bluetooth
             } else if is_dongle {
@@ -230,7 +235,6 @@ impl DeviceDiscovery for HidDiscovery {
                 TransportType::HidWired
             };
 
-            let path = device_info.path().to_string_lossy().to_string();
             let serial = device_info.serial_number().map(|s| s.to_string());
             let product_name = device_info.product_string().map(|s| s.to_string());
 
@@ -297,77 +301,111 @@ impl DeviceDiscovery for HidDiscovery {
                 ))
             }
             TransportType::HidWired | TransportType::HidDongle => {
-                // Find and open the USB feature interface.
-                // Match by device_path to distinguish multiple same-VID/PID devices.
-                // The discovered device_path points to the feature interface (IF2),
-                // so an exact path match is the primary lookup strategy.
-                let feature_info = api
-                    .device_list()
-                    .find(|d| {
-                        d.path().to_string_lossy() == device.info.device_path
-                            && Self::is_usb_feature_interface(d)
-                    })
-                    // Fallback: VID/PID match (for devices discovered before path was tracked)
-                    .or_else(|| {
-                        api.device_list().find(|d| {
-                            d.vendor_id() == device.info.vid
-                                && d.product_id() == device.info.pid
+                // Beiying / BYTech devices expose Report ID 0x09 In/Out (not Rongyuan Feature IF2).
+                if device.info.transport_type == TransportType::HidWired
+                    && let Some(beiying_info) = api
+                        .device_list()
+                        .find(|d| {
+                            d.path().to_string_lossy() == device.info.device_path
+                                && crate::beiying::is_beiying_hidraw_device(
+                                    &d.path().to_string_lossy(),
+                                )
+                                .is_some()
+                        })
+                        .or_else(|| {
+                            api.device_list().find(|d| {
+                                d.vendor_id() == device.info.vid
+                                    && d.product_id() == device.info.pid
+                                    && crate::beiying::is_beiying_hidraw_device(
+                                        &d.path().to_string_lossy(),
+                                    )
+                                    .is_some()
+                            })
+                        })
+                {
+                    Arc::new(crate::beiying::HidBeiyingTransport::open(
+                        beiying_info,
+                        device.info.clone(),
+                        &api,
+                    )?)
+                } else {
+                    // Find and open the USB feature interface.
+                    // Match by device_path to distinguish multiple same-VID/PID devices.
+                    // The discovered device_path points to the feature interface (IF2),
+                    // so an exact path match is the primary lookup strategy.
+                    let feature_info = api
+                        .device_list()
+                        .find(|d| {
+                            d.path().to_string_lossy() == device.info.device_path
                                 && Self::is_usb_feature_interface(d)
                         })
-                    })
-                    .ok_or_else(|| {
-                        TransportError::DeviceNotFound(format!(
-                            "Feature interface for {:04X}:{:04X}",
-                            device.info.vid, device.info.pid
+                        // Fallback: VID/PID match (for devices discovered before path was tracked)
+                        .or_else(|| {
+                            api.device_list().find(|d| {
+                                d.vendor_id() == device.info.vid
+                                    && d.product_id() == device.info.pid
+                                    && Self::is_usb_feature_interface(d)
+                            })
+                        })
+                        .ok_or_else(|| {
+                            TransportError::DeviceNotFound(format!(
+                                "Feature interface for {:04X}:{:04X}",
+                                device.info.vid, device.info.pid
+                            ))
+                        })?;
+
+                    let feature_device = feature_info
+                        .open_device(&api)
+                        .map_err(TransportError::from)?;
+
+                    let feature_path = feature_info.path().to_string_lossy().to_string();
+
+                    // Try to open input interface (sibling of feature interface)
+                    let input_device = self
+                        .find_usb_input_device(
+                            &api,
+                            device.info.vid,
+                            device.info.pid,
+                            &feature_path,
+                        )
+                        .and_then(|info| info.open_device(&api).ok());
+
+                    if input_device.is_some() {
+                        debug!("Opened USB input interface for events");
+                    }
+
+                    if device.info.transport_type == TransportType::HidDongle {
+                        // Open IF1 for dongle patch discovery (Feature Report ID 8)
+                        let if1_device = Self::find_dongle_if1_device(
+                            &api,
+                            device.info.vid,
+                            device.info.pid,
+                            &feature_path,
+                        )
+                        .and_then(|info| match info.open_device(&api) {
+                            Ok(dev) => {
+                                debug!("Opened dongle IF1 for patch discovery");
+                                Some(dev)
+                            }
+                            Err(e) => {
+                                debug!("Failed to open dongle IF1: {}", e);
+                                None
+                            }
+                        });
+
+                        Arc::new(HidDongleTransport::new(
+                            feature_device,
+                            input_device,
+                            if1_device,
+                            device.info.clone(),
                         ))
-                    })?;
-
-                let feature_device = feature_info
-                    .open_device(&api)
-                    .map_err(TransportError::from)?;
-
-                let feature_path = feature_info.path().to_string_lossy().to_string();
-
-                // Try to open input interface (sibling of feature interface)
-                let input_device = self
-                    .find_usb_input_device(&api, device.info.vid, device.info.pid, &feature_path)
-                    .and_then(|info| info.open_device(&api).ok());
-
-                if input_device.is_some() {
-                    debug!("Opened USB input interface for events");
-                }
-
-                if device.info.transport_type == TransportType::HidDongle {
-                    // Open IF1 for dongle patch discovery (Feature Report ID 8)
-                    let if1_device = Self::find_dongle_if1_device(
-                        &api,
-                        device.info.vid,
-                        device.info.pid,
-                        &feature_path,
-                    )
-                    .and_then(|info| match info.open_device(&api) {
-                        Ok(dev) => {
-                            debug!("Opened dongle IF1 for patch discovery");
-                            Some(dev)
-                        }
-                        Err(e) => {
-                            debug!("Failed to open dongle IF1: {}", e);
-                            None
-                        }
-                    });
-
-                    Arc::new(HidDongleTransport::new(
-                        feature_device,
-                        input_device,
-                        if1_device,
-                        device.info.clone(),
-                    ))
-                } else {
-                    Arc::new(HidWiredTransport::new(
-                        feature_device,
-                        input_device,
-                        device.info.clone(),
-                    ))
+                    } else {
+                        Arc::new(HidWiredTransport::new(
+                            feature_device,
+                            input_device,
+                            device.info.clone(),
+                        ))
+                    }
                 }
             }
             _ => {

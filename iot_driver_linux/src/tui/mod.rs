@@ -359,70 +359,130 @@ impl App {
                 .map_err(|e| format!("Failed to open device: {e}"))?
         };
 
+        self.setup_connected_transport(transport);
+        self.status_msg = if self.is_wireless && self.battery.as_ref().is_some_and(|b| b.idle) {
+            "Keyboard sleeping - press a key to wake before querying".to_string()
+        } else {
+            format!("Connected to {}", self.device_name)
+        };
+
+        Ok(())
+    }
+
+    /// Initialize `KeyboardInterface` and UI state from an opened HID transport.
+    fn setup_connected_transport(&mut self, transport: Arc<dyn Transport>) {
         let transport_info = transport.device_info().clone();
         let vid = transport_info.vid;
         let pid = transport_info.pid;
 
         let flow_transport = Arc::new(FlowControlTransport::new(transport));
 
-        // Query device_id for accurate DB lookup (shared PIDs are ambiguous without it)
-        let device_id = flow_transport
-            .query_command(
-                cmd::GET_USB_VERSION,
-                &[],
-                monsgeek_transport::ChecksumType::Bit7,
+        let (
+            kb,
+            device_name,
+            has_sidelight,
+            has_magnetism,
+            key_count,
+            display_key_count,
+            polling_rate_support,
+            polling_rates,
+        ) = if let Some(by) = flow_transport.as_beiying() {
+            const BEIYING_RATES: &[u16] = &[8000, 4000, 2000, 1000, 500, 250, 125];
+            let kc = by.key_count() as u8;
+            let side_light_avail = by.session().side_light_available;
+            let key_names: Vec<String> =
+                by.key_slots().iter().map(|s| s.name.to_string()).collect();
+            let defaults: Vec<u8> = by.key_slots().iter().map(|s| s.hid_usage).collect();
+            let dev_name = transport_info
+                .product_name
+                .clone()
+                .unwrap_or_else(|| "Akko TAC75 HE (Beiying)".to_string());
+            let mut kb = KeyboardInterface::new(
+                flow_transport,
+                kc,
+                true,
+                monsgeek_transport::protocol::ProtocolFamily::Beiying,
+            );
+            kb.set_polling_rates(BEIYING_RATES.to_vec());
+            kb.set_matrix_key_names(key_names);
+            kb.set_matrix_defaults(defaults);
+            kb.set_active_profile(kb.get_profile().unwrap_or_default());
+            (
+                kb,
+                dev_name,
+                side_light_avail,
+                true,
+                kc,
+                kc,
+                crate::device_loader::PollingRateSupport::Always,
+                BEIYING_RATES,
             )
-            .ok()
-            .filter(|r| r.len() >= 5 && r[0] == cmd::GET_USB_VERSION)
-            .map(|r| u32::from_le_bytes([r[1], r[2], r[3], r[4]]) as i32);
+        } else {
+            let device_id = flow_transport
+                .query_command(
+                    cmd::GET_USB_VERSION,
+                    &[],
+                    monsgeek_transport::ChecksumType::Bit7,
+                )
+                .ok()
+                .filter(|r| r.len() >= 5 && r[0] == cmd::GET_USB_VERSION)
+                .map(|r| u32::from_le_bytes([r[1], r[2], r[3], r[4]]) as i32);
 
-        let db_key_count = devices::key_count_with_id(device_id, vid, pid);
-        let has_magnetism = devices::has_magnetism_with_id(device_id, vid, pid);
-        let device_info = devices::get_device_info_with_id(device_id, vid, pid);
-        let has_sidelight = device_info
-            .as_ref()
-            .map(|d| d.has_sidelight)
-            .unwrap_or(false);
-        let device_name = device_info
-            .as_ref()
-            .map(|d| d.display_name.clone())
-            .or_else(|| transport_info.product_name.clone())
-            .unwrap_or_else(|| format!("Device {vid:04x}:{pid:04x}"));
+            let db_key_count = devices::key_count_with_id(device_id, vid, pid);
+            let has_magnetism = devices::has_magnetism_with_id(device_id, vid, pid);
+            let device_info = devices::get_device_info_with_id(device_id, vid, pid);
+            let has_sidelight = device_info
+                .as_ref()
+                .map(|d| d.has_sidelight)
+                .unwrap_or(false);
+            let device_name = device_info
+                .as_ref()
+                .map(|d| d.display_name.clone())
+                .or_else(|| transport_info.product_name.clone())
+                .unwrap_or_else(|| format!("Device {vid:04x}:{pid:04x}"));
 
-        let protocol = monsgeek_transport::protocol::ProtocolFamily::detect(
-            device_info.as_ref().map(|d| d.name.as_str()),
-            pid,
-        );
+            let protocol = monsgeek_transport::protocol::ProtocolFamily::detect(
+                device_info.as_ref().map(|d| d.name.as_str()),
+                pid,
+            );
 
-        // Try matrix database for key names and matrix size
-        let registry = crate::profile_registry();
-        let matrix_db: Option<&crate::device_loader::JsonDeviceMatrix> =
-            device_id.and_then(|id| registry.get_device_matrix(vid, pid, id));
-        let key_count = crate::device_loader::scan_extent(db_key_count, matrix_db);
-        let display_key_count = crate::device_loader::display_key_count(db_key_count, matrix_db);
+            let registry = crate::profile_registry();
+            let matrix_db: Option<&crate::device_loader::JsonDeviceMatrix> =
+                device_id.and_then(|id| registry.get_device_matrix(vid, pid, id));
+            let key_count = crate::device_loader::scan_extent(db_key_count, matrix_db);
+            let display_key_count =
+                crate::device_loader::display_key_count(db_key_count, matrix_db);
 
-        let mut kb = KeyboardInterface::new(flow_transport, key_count, has_magnetism, protocol);
-        let (polling_rate_support, polling_rates) =
-            resolve_polling_rate(device_id, vid, pid, transport_info.transport_type);
-        kb.set_polling_rates(polling_rates.to_vec());
+            let mut kb = KeyboardInterface::new(flow_transport, key_count, has_magnetism, protocol);
+            let (polling_rate_support, polling_rates) =
+                resolve_polling_rate(device_id, vid, pid, transport_info.transport_type);
+            kb.set_polling_rates(polling_rates.to_vec());
 
-        if let Some(names) = registry.resolve_matrix_key_names(device_id, vid, pid) {
-            kb.set_matrix_key_names(names);
-        }
-        if let Some(m) = matrix_db {
-            kb.set_matrix_defaults(m.matrix.clone());
-        }
+            if let Some(names) = registry.resolve_matrix_key_names(device_id, vid, pid) {
+                kb.set_matrix_key_names(names);
+            }
+            if let Some(m) = matrix_db {
+                kb.set_matrix_defaults(m.matrix.clone());
+            }
 
-        // Per-profile data is read and written against whichever profile the board
-        // is actually running.
-        kb.set_active_profile(kb.get_profile().unwrap_or_default());
+            kb.set_active_profile(kb.get_profile().unwrap_or_default());
 
-        // Set non-analog positions from matrix database (encoder/GPIO keys).
-        if let Some(matrix) = matrix_db
-            && let Some(positions) = &matrix.non_analog_positions
-        {
-            kb.set_non_analog_positions(positions.clone());
-        }
+            if let Some(matrix) = matrix_db
+                && let Some(positions) = &matrix.non_analog_positions
+            {
+                kb.set_non_analog_positions(positions.clone());
+            }
+            (
+                kb,
+                device_name,
+                has_sidelight,
+                has_magnetism,
+                key_count,
+                display_key_count,
+                polling_rate_support,
+                polling_rates,
+            )
+        };
 
         let matrix_size = kb.matrix_size();
         let matrix_key_names: Vec<String> = (0..matrix_size)
@@ -432,7 +492,6 @@ impl App {
         let keyboard = Arc::new(kb);
         let is_wireless = keyboard.is_wireless();
 
-        // Subscribe to low-latency event notifications
         self.event_rx = keyboard.subscribe_events();
 
         self.device_name = device_name;
@@ -448,17 +507,13 @@ impl App {
         self.polling_rates = polling_rates;
         self.keyboard = Some(keyboard);
 
-        // Initialize key depths array based on actual key count
         self.key_depths = vec![0.0; self.key_count as usize];
-        // Initialize depth history for time series
         self.depth_history =
             vec![VecDeque::with_capacity(DEPTH_HISTORY_LEN); self.key_count as usize];
-        // Initialize last update times (set to past so they don't show as active)
         self.depth_last_update = vec![Instant::now(); self.key_count as usize];
         self.active_keys.clear();
         self.selected_keys.clear();
 
-        // Detect battery source (kernel power_supply if eBPF loaded, else vendor)
         if self.is_wireless {
             self.battery_source = if let Some(path) = find_hid_battery_power_supply(vid, pid) {
                 Some(BatterySource::Kernel(path))
@@ -469,7 +524,6 @@ impl App {
 
         self.connected = true;
 
-        // Load dongle info (instant dongle-local queries)
         if self.is_wireless
             && let Some(ref keyboard) = self.keyboard
         {
@@ -479,21 +533,9 @@ impl App {
             self.rf_info = transport.query_rf_info().ok().flatten();
         }
 
-        // Load battery status immediately for wireless devices
         if self.is_wireless {
             self.refresh_battery();
-            // Show warning if keyboard is idle/sleeping
-            if self.battery.as_ref().map(|b| b.idle).unwrap_or(false) {
-                self.status_msg =
-                    "Keyboard sleeping - press a key to wake before querying".to_string();
-            } else {
-                self.status_msg = format!("Connected to {}", self.device_name);
-            }
-        } else {
-            self.status_msg = format!("Connected to {}", self.device_name);
         }
-
-        Ok(())
     }
 
     /// Scan for devices and populate the device picker list.
@@ -537,116 +579,7 @@ impl App {
                 self.device_selector = Some(label.index.to_string());
                 self.show_device_picker = false;
 
-                // Now do the full connection setup with this transport
-                let transport_info = transport.device_info().clone();
-                let vid = transport_info.vid;
-                let pid = transport_info.pid;
-                let flow_transport = Arc::new(FlowControlTransport::new(transport));
-
-                let device_id = flow_transport
-                    .query_command(
-                        cmd::GET_USB_VERSION,
-                        &[],
-                        monsgeek_transport::ChecksumType::Bit7,
-                    )
-                    .ok()
-                    .filter(|r| r.len() >= 5 && r[0] == cmd::GET_USB_VERSION)
-                    .map(|r| u32::from_le_bytes([r[1], r[2], r[3], r[4]]) as i32);
-
-                let db_key_count = devices::key_count_with_id(device_id, vid, pid);
-                let has_magnetism = devices::has_magnetism_with_id(device_id, vid, pid);
-                let device_info = devices::get_device_info_with_id(device_id, vid, pid);
-                let has_sidelight = device_info
-                    .as_ref()
-                    .map(|d| d.has_sidelight)
-                    .unwrap_or(false);
-                let device_name = device_info
-                    .as_ref()
-                    .map(|d| d.display_name.clone())
-                    .or_else(|| transport_info.product_name.clone())
-                    .unwrap_or_else(|| format!("Device {vid:04x}:{pid:04x}"));
-
-                let protocol = monsgeek_transport::protocol::ProtocolFamily::detect(
-                    device_info.as_ref().map(|d| d.name.as_str()),
-                    pid,
-                );
-
-                let registry = crate::profile_registry();
-                let matrix_db = device_id.and_then(|id| registry.get_device_matrix(vid, pid, id));
-                let key_count = crate::device_loader::scan_extent(db_key_count, matrix_db);
-                let display_key_count =
-                    crate::device_loader::display_key_count(db_key_count, matrix_db);
-
-                let mut kb =
-                    KeyboardInterface::new(flow_transport, key_count, has_magnetism, protocol);
-                let (polling_rate_support, polling_rates) =
-                    resolve_polling_rate(device_id, vid, pid, transport_info.transport_type);
-                kb.set_polling_rates(polling_rates.to_vec());
-
-                if let Some(names) = registry.resolve_matrix_key_names(device_id, vid, pid) {
-                    kb.set_matrix_key_names(names);
-                }
-                if let Some(m) = matrix_db {
-                    kb.set_matrix_defaults(m.matrix.clone());
-                }
-
-                kb.set_active_profile(kb.get_profile().unwrap_or_default());
-
-                if let Some(matrix) = matrix_db
-                    && let Some(positions) = &matrix.non_analog_positions
-                {
-                    kb.set_non_analog_positions(positions.clone());
-                }
-
-                let matrix_size = kb.matrix_size();
-                let matrix_key_names: Vec<String> = (0..matrix_size)
-                    .map(|i| kb.matrix_key_name(i).to_string())
-                    .collect();
-
-                let keyboard = Arc::new(kb);
-                let is_wireless = keyboard.is_wireless();
-
-                self.event_rx = keyboard.subscribe_events();
-                self.device_name = device_name;
-                self.transport_name = transport_type_name(transport_info.transport_type);
-                self.key_count = key_count;
-                self.display_key_count = display_key_count;
-                self.has_sidelight = has_sidelight;
-                self.has_magnetism = has_magnetism;
-                self.matrix_size = matrix_size;
-                self.matrix_key_names = matrix_key_names;
-                self.is_wireless = is_wireless;
-                self.polling_rate_support = polling_rate_support;
-                self.polling_rates = polling_rates;
-                self.keyboard = Some(keyboard);
-
-                self.key_depths = vec![0.0; self.key_count as usize];
-                self.depth_history =
-                    vec![VecDeque::with_capacity(DEPTH_HISTORY_LEN); self.key_count as usize];
-                self.depth_last_update = vec![Instant::now(); self.key_count as usize];
-                self.active_keys.clear();
-                self.selected_keys.clear();
-
-                if self.is_wireless {
-                    self.battery_source =
-                        if let Some(path) = find_hid_battery_power_supply(vid, pid) {
-                            Some(BatterySource::Kernel(path))
-                        } else {
-                            Some(BatterySource::Vendor)
-                        };
-                }
-
-                self.connected = true;
-
-                if self.is_wireless {
-                    if let Some(ref keyboard) = self.keyboard {
-                        let transport = keyboard.transport();
-                        self.dongle_info = transport.query_dongle_info().ok().flatten();
-                        self.dongle_status = transport.query_dongle_status().ok().flatten();
-                        self.rf_info = transport.query_rf_info().ok().flatten();
-                    }
-                    self.refresh_battery();
-                }
+                self.setup_connected_transport(transport);
 
                 // Reset loading states so tabs re-fetch
                 self.loading = LoadingStates::default();

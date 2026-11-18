@@ -7,6 +7,7 @@
 //! - HID Dongle (2.4GHz wireless via USB dongle)
 //! - HID Bluetooth (BLE via kernel's hid-over-gatt driver)
 
+pub mod beiying;
 pub mod command;
 pub mod device_registry;
 pub mod error;
@@ -94,6 +95,7 @@ pub use types::{
     TimestampedEvent, TransportDeviceInfo, TransportType, VendorEvent,
 };
 
+pub use beiying::HidBeiyingTransport;
 pub use discovery::{DeviceDiscovery, HidDiscovery, ProbedDevice, format_device_list};
 pub use flow_control::FlowControlTransport;
 pub use hid_bluetooth::HidBluetoothTransport;
@@ -173,6 +175,11 @@ pub trait Transport: Send + Sync {
     /// Returns raw report bytes on success, None if not supported.
     fn get_dongle_patch_info(&self) -> Result<Option<Vec<u8>>, TransportError> {
         Ok(None)
+    }
+
+    /// Access the underlying Beiying `Report ID 0x09` transport when connected to a BYTech device.
+    fn as_beiying(&self) -> Option<&beiying::HidBeiyingTransport> {
+        None
     }
 }
 

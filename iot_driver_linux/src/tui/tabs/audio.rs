@@ -267,6 +267,8 @@ fn start(app: &mut App, led_mode: u8) {
         app.audio.error = Some(format!("Failed to set visualizer mode: {e}"));
     }
 
+    sync_beiying_state(&capture.state, app);
+
     let running = Arc::new(AtomicBool::new(true));
     let viz_state = Arc::clone(&capture.state);
     let viz_running = Arc::clone(&running);
@@ -285,6 +287,22 @@ fn start(app: &mut App, led_mode: u8) {
     });
 }
 
+fn sync_beiying_state(state: &crate::audio_reactive::AudioState, app: &App) {
+    use std::sync::atomic::Ordering;
+    state
+        .beiying_style
+        .store(app.audio.style, Ordering::Relaxed);
+    let packed = if app.info.led_dazzle {
+        0
+    } else {
+        0x0100_0000
+            | ((app.info.led_r as u32) << 16)
+            | ((app.info.led_g as u32) << 8)
+            | (app.info.led_b as u32)
+    };
+    state.beiying_solid_rgb.store(packed, Ordering::Relaxed);
+}
+
 /// Visualizer color: the firmware rainbow cycle when the keyboard's **Dazzle**
 /// flag is on, else a solid color (the current LED color). Tying it to Dazzle
 /// reuses the existing flag instead of a separate audio toggle.
@@ -295,6 +313,9 @@ fn viz_color(app: &App) -> Option<(u8, u8, u8)> {
 /// Re-send the music mode + current style/color to the keyboard (used on style,
 /// color, or Bars↔Patterns change). The viz thread keeps streaming bands.
 fn reapply_mode(app: &mut App, led_mode: u8) {
+    if let Some(run) = app.audio.run.as_ref() {
+        sync_beiying_state(&run.capture.state, app);
+    }
     if let Some(kb) = app.keyboard.clone() {
         let _ = kb.set_music_viz_mode(
             led_mode,

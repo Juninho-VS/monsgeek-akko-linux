@@ -196,9 +196,13 @@ fn run_screen_color_loop(
                 let _ = std::io::stdout().flush();
             }
 
-            let report = screen_color::build_report(r, g, b);
-            // No-delay streaming send (the default flow-control delay would cap us).
-            let _ = keyboard.send_raw_cmd_fast(cmd::SET_SCREEN_COLOR, &report[1..8]);
+            if let Some(by) = keyboard.beiying() {
+                let _ = by.send_full_color_realtime([r, g, b]);
+            } else {
+                let report = screen_color::build_report(r, g, b);
+                // No-delay streaming send (the default flow-control delay would cap us).
+                let _ = keyboard.send_raw_cmd_fast(cmd::SET_SCREEN_COLOR, &report[1..8]);
+            }
             last_color = (r, g, b);
         }
 
@@ -208,6 +212,9 @@ fn run_screen_color_loop(
         }
     }
 
+    if let Some(by) = keyboard.beiying() {
+        let _ = by.clear_realtime_leds();
+    }
     if show_readout {
         println!(); // end the in-place readout line
     }
