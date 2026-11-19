@@ -58,3 +58,29 @@ Keep it running while using `https://demo.hubx.pro/keyboard/`.
 ```bash
 ./target/release/webenftool-linux audio --mode 168 --brightness 100 --amplitude 600
 ```
+
+## Running as a Background User Service (`systemd`)
+
+To keep the WebSocket companion ready in the background on login (so `demo.hubx.pro` works without opening a terminal), run it as a **user** service (not `sudo`) so it has access to your PipeWire/PulseAudio audio session:
+
+```bash
+sudo install -D -m 755 target/release/webenftool-linux /usr/local/bin/webenftool-linux
+mkdir -p ~/.config/systemd/user
+
+cat << 'EOF' > ~/.config/systemd/user/webenftool.service
+[Unit]
+Description=WebEnfTool Linux Companion (BYTech / HubX Audio WebSocket)
+After=pipewire-pulse.service pulseaudio.service
+
+[Service]
+ExecStart=/usr/local/bin/webenftool-linux serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now webenftool.service
+```

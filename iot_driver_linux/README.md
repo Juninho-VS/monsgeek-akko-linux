@@ -1,6 +1,6 @@
 # iot_driver — Linux Driver for MonsGeek/Akko Magnetic Hall Effect Keyboards
 
-A command-line tool and gRPC server for controlling MonsGeek M1 V5 HE (and compatible Akko/RongYuan RY5088-based) keyboards on Linux.
+A command-line tool, interactive TUI, and gRPC server for controlling MonsGeek M1 V5 HE, compatible Akko/RongYuan RY5088-based keyboards, and **Shenzhen Beiying / BYTech (`Report ID 0x09`)** boards such as the **Akko TAC75 HE (`38ee:0016`)** on Linux.
 
 > **Disclaimer**: This software is provided as-is, without warranty of any kind,
 > express or implied. **Firmware flashing carries inherent risk** — a failed or
@@ -36,6 +36,11 @@ By default it captures the **monitor** of your default output sink (so it reacts
 to whatever is playing); pick another source with `audio --device <name>` (see
 `audio-test` for candidates).
 
+On **Shenzhen Beiying (`Report ID 0x09`)** boards (such as Akko TAC75 HE),
+`iot_driver audio --style <0|1|2>` streams per-key RGB frames (`0` = Spectrum
+Columns, `1` = Vertical Energy Bars, `2` = Beat Ripple) and restores your
+saved hardware LED effect cleanly on exit.
+
 ## Supported Devices
 
 | Device | VID:PID | Bootloader |
@@ -44,6 +49,7 @@ to whatever is playing); pick another source with `audio --device <name>` (see
 | Keyboard (2.4 GHz via dongle) | `3151:5038` | — |
 | Keyboard (Bluetooth) | `3151:5027` | — |
 | 2.4 GHz Dongle | `3151:5038` | `3151:5039` |
+| Akko TAC75 HE / Beiying `Report ID 0x09` (USB wired) | `38ee:0016` | — |
 
 ## Quick Start
 

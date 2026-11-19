@@ -13,6 +13,7 @@ This document is the single source of truth for the MonsGeek/Akko keyboard HID p
 7. [Device Database](#7-device-database)
 8. [Firmware Update (RY Bootloader)](#8-firmware-update-ry-bootloader)
 9. [Firmware Limits: Chunked SET Commands](#firmware-limits-chunked-set-commands)
+10. [Shenzhen Beiying / BYTech Protocol (Report ID 0x09)](#10-shenzhen-beiying--bytech-protocol-report-id-0x09)
 
 ---
 
@@ -1409,6 +1410,52 @@ assert total_size <= 514     accumulated payload bytes
 `SET_AUDIO_VIZ` (0x0D) is safe — it reads a fixed 16-band array with no index
 indirection (USB: full bytes at payload +8; dongle/BT: nibble-packed after the
 command byte — see [§5.6](#56-audio-visualizer-set_audio_viz-0x0d)).
+
+---
+
+## 10. Shenzhen Beiying / BYTech Protocol (Report ID 0x09)
+
+Some Akko-branded Hall Effect keyboards (such as the **Akko TAC75 HE**, `38ee:0016`) share a USB `VID:PID` with RongYuan entries in `devices.json` but run **Shenzhen Beiying / BYTech** firmware instead of RY5088/YiChip.
+
+### Discovery & Safety Rule
+
+- **Identification**: Verified passively via `/sys/class/hidraw/<dev>/device/report_descriptor` before opening HID or trusting `devices.json`.
+  - Vendor collection (`Usage Page >= 0xFF00`, e.g. `0xFF00`, `Usage 0x01`) exposing **Report ID `0x09`** for both Input and Output (`64` bytes wired, `20` bytes wireless).
+- **Critical**: Never send RongYuan `SET_FEATURE`/`GET_FEATURE` (Report ID `0x00`) packets to a Report ID `0x09` interface. Use standard HID Input/Output reports (`write` / `read_timeout`) exclusively.
+
+### 64-Byte Wired Frame Format
+
+```
+Byte:  [ 0 ]  [ 1 ]  [  2  ]  [ 3 ]  [    4    ]  [   5   ]  [   6    ]  [ 7..62 ]  [   63   ]
+Field:  0x09   cmd    param    b3     total_pkts   cur_pkt    data_len    payload    checksum
+```
+
+- **Checksum**: `pkt[63] = !sum(pkt[0..63])` (`255u8.wrapping_sub(sum)`).
+- **Aligned multi-packet chunking**: Items must never split across the 56-byte (`MAX_CHUNK_PAYLOAD`) boundary. Queries with `req_unit` request stride and `resp_unit` response stride batch `(56 / max(req_unit, resp_unit)) * req_unit` bytes per request packet.
+
+### Command Reference
+
+| Command | Direction | Description |
+|---|---|---|
+| `0x82` | GET | Device handshake & capabilities: `param=1` UUID (6B BE, e.g. `11000000004D` for TAC75 HE), `2` FW version (2B LE), `3` supported switches bitset, `4` supported advanced keys bitset, `6` min RT (µm), `8` travel precision (`0` -> `10` µm = `0.01mm`), `9` lighting caps (`[17]` music, `[18]` sidelight, `[19]` logo, `[20]` sidelight count), `15` features (`[9]` LED protocol flags, `[16]` direction support, `[17]` side sync, `[18]` profile count) |
+| `0x87` | GET | Status & battery (`[level, flags]`, `(flags & 0xF0) != 0` charging) |
+| `0x90` / `0x10` | GET / SET | Active profile (`u8`) |
+| `0x84` / `0x04` | GET / SET | System & lighting parameters by `param`: `1` main LED `[id, colorIdx, r, g, b, bright(0..=20), speed(0..=4), ?dir]`, `6` side LED `[id, colorIdx, r, g, b, bright(0..=4), speed(0..=4)]`, `17` OS mode (`0=Win, 1=Mac`), `19` sleep (`u16` BE s), `21` WinLock, `23` polling rate (`0=1000Hz, 1=500Hz, 2=250Hz, 3=125Hz, 4=8000Hz, 5=4000Hz, 6=2000Hz`), `25` adaptive calibration, `29` debounce mode, `30` debounce (`u16` BE ms), `32` low power, `33` WASD swap, `34` side sync |
+| `0x83` / `0x03` | GET / SET | Per-key bindings (`param = (by_layer & 3) \| ((os_mode & 7) << 2)`, `by_layer`: `0=Base, 1=Fn1, 2=Fn2`; 6B items `[key_id_be16, kc_be32]`). BYTech `u32` keycodes: Normal `0x00MM_00XX`, Mouse `0x0101_00XX`, Consumer `0x0200_XXXX`, Macro `0x03TT_CCII`, Fn `0x0D00_0000` |
+| `0x93` / `0x13` | GET / SET | Hall Effect actuation point in µm (`param = layer_sys`; SET 5B `[key_id_be16, um_be16, 0]`) |
+| `0x99` / `0x19` | GET / SET | Rapid Trigger (`[key_id_be16, enable, press_um_be16, release_um_be16, 0]`, 8B) |
+| `0x96` / `0x16` | GET / SET | Deadzones (`param = 0`; `[key_id_be16, top_um_be16, bottom_um_be16, 0, enable]`, 8B) |
+| `0x98` | CTL / EVT | Real-time travel monitoring (`0=Start` with `~1s` keepalive, `2=Stop`, `1=Read` bubbles `[key_id_be16, dist_um_be16, ad_press_be16]`) |
+| `0x94` | CTL / EVT | Travel calibration (`0=Start/keepalive`, `4=Stop`, `2=Read` bubble, `5=AD range`) |
+| `0xA1` | GET | Query physical LED bead addresses (`[key_id_be16]` max 10/pkt -> `[key_id_be16, count, addrs...]`, `col = addr & 7`, `row = addr >> 3`) |
+| `0x08` | SET (Stream) | Real-time per-key RGB: `subcmd=1` grouped RGB888 `[r,g,b,cnt,ids...]`, `subcmd=2` uniform/clear `[r,g,b]`, `subcmd=3` dense RGB565 BE (`led_flags & 0x04`), `subcmd=4` grouped RGB565 BE (`led_flags & 0x08`) |
+| `0x0E` | SET (Stream) | Real-time side lightbar (`subcmd=1` `[r,g,b,cnt,idxs...]`, `subcmd=2` off `[0,0,0]`) |
+| `0x0B` | SET | Host telemetry/clock sync (`[vol, cpu, mem, year_le16, month, day, hour, min, sec, weekday, cpu_temp, weather_code, weather_temp]`) |
+| `0x11` | SET | Reset (`param`: `0=Full, 1=Keymap, 2=Lighting, 3=USB`) |
+
+### Akko TAC75 HE Key IDs (`UUID 0x11000000004D`, 83 Keys)
+
+Physical `key_id` values are `0x01..=0x4D` plus `0x62` (`Ins`), `0x63` (`Del`), `0x64` (`Home`), `0x65` (`End`), `0x66` (`PgUp`), and `0x67` (`PgDn`).
 
 ---
 

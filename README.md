@@ -3,13 +3,14 @@
 
 [![CI](https://github.com/echtzeit-solutions/monsgeek-akko-linux/actions/workflows/ci.yml/badge.svg)](https://github.com/echtzeit-solutions/monsgeek-akko-linux/actions/workflows/ci.yml)
 
-A Linux userspace driver for MonsGeek, Akko, and other magnetic keyboards using RongYuan firmware (RY5088/YC3121 chipsets). Provides full configuration support via CLI, TUI, and gRPC server compatible with the official web configurator.
+A Linux userspace driver for MonsGeek, Akko, and other magnetic keyboards using RongYuan firmware (RY5088/YC3121 chipsets) or **Shenzhen Beiying / BYTech (`Report ID 0x09`)** firmware. Provides full configuration support via CLI, TUI, and gRPC server compatible with the official web configurator, plus a standalone BYTech WebSocket companion ([webenftool_linux/README.md](webenftool_linux/README.md)).
 
 ## Supported Devices
 
 - MonsGeek M1 V5 HE (Wired) - VID:3151 PID:5030
 - MonsGeek M1 V5 HE (Wireless/2.4GHz) - VID:3151 PID:503A
 - Akko MOD007B-HE and other Akko HE keyboards (same protocol)
+- **Akko TAC75 HE** and compatible **Shenzhen Beiying / BYTech (`Report ID 0x09`)** boards (`VID:38ee PID:0016`) — detected automatically via passive sysfs HID report-descriptor verification (`Usage Page >= 0xFF00`, `Report ID 0x09` Input/Output)
 - Rebranded boards under other vendor IDs (Akko 0x38EE and others), when their
   VID:PID is in the device database (`make update-device-db` refreshes it). Any
   VID 0x3151 product is tried even when it is not listed.
@@ -44,7 +45,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 sudo apt install build-essential pkg-config libudev-dev libhidapi-dev protobuf-compiler
 
 # Audio reactive mode (required for audio features)
-sudo apt install libasound2-dev
+sudo apt install libasound2-dev libpulse-dev
 
 # Optional: JACK audio support
 sudo apt install libjack-jackd2-dev
@@ -62,7 +63,7 @@ sudo apt install libpipewire-0.3-dev libclang-dev
 sudo pacman -S base-devel pkgconf hidapi protobuf
 
 # Audio reactive mode (required for audio features)
-sudo pacman -S alsa-lib
+sudo pacman -S alsa-lib libpulse
 
 # Optional: JACK audio support
 sudo pacman -S jack2
@@ -80,7 +81,7 @@ sudo pacman -S pipewire clang
 sudo dnf install gcc make pkgconf-pkg-config systemd-devel hidapi-devel protobuf-compiler
 
 # Audio reactive mode (required for audio features)
-sudo dnf install alsa-lib-devel
+sudo dnf install alsa-lib-devel pulseaudio-libs-devel
 
 # Optional: JACK audio support
 sudo dnf install jack-audio-connection-kit-devel
@@ -98,7 +99,7 @@ sudo dnf install pipewire-devel clang-devel
 sudo zypper install gcc make pkg-config systemd-devel hidapi-devel protobuf-devel
 
 # Audio reactive mode (required for audio features)
-sudo zypper install alsa-devel
+sudo zypper install alsa-devel libpulse-devel
 
 # Optional: JACK audio support
 sudo zypper install libjack-devel
@@ -310,6 +311,50 @@ The server runs on `127.0.0.1:3814` with gRPC-Web support.
 - Key remapping
 - Macro editor
 - Firmware updates (use with caution)
+
+### HubX / BYTech Web App (demo.hubx.pro)
+
+Shenzhen Beiying (`Report ID 0x09`) keyboards such as the **Akko TAC75 HE** can be configured directly via WebHID on `https://demo.hubx.pro/keyboard/` in Chromium-based browsers, or natively via `iot_driver`.
+
+For browser-controlled **Music Rhythm** on Linux without `WebEnfTool.exe`, build and run the companion server in [webenftool_linux](webenftool_linux/README.md):
+
+```bash
+cd webenftool_linux
+cargo build --release
+./target/release/webenftool-linux serve
+```
+
+Then keep it running while using `https://demo.hubx.pro/keyboard/`.
+
+### Running Reactive Lighting in the Background (`systemd --user`)
+
+Static settings saved to keyboard flash (triggers, Rapid Trigger, polling rate, keymaps, fixed LED modes) persist without any background daemon. Only live **audio/screen-reactive lighting** (or the HubX audio WebSocket companion) needs a background process.
+
+Run it as a **user** service (without `sudo`) so it attaches to your session's PipeWire/PulseAudio audio server:
+
+```bash
+sudo make install-driver
+mkdir -p ~/.config/systemd/user
+
+cat << 'EOF' > ~/.config/systemd/user/akko-audio.service
+[Unit]
+Description=Akko Keyboard Audio Reactive Lighting (iot_driver)
+After=pipewire-pulse.service pulseaudio.service
+
+[Service]
+ExecStart=/usr/local/bin/iot_driver audio --style 0
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now akko-audio.service
+```
+
+*(For browser-controlled audio via `demo.hubx.pro`, create an equivalent unit running `webenftool-linux serve`; avoid running both audio loops simultaneously.)*
 
 ## LED Modes
 
