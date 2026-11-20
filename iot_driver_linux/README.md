@@ -401,6 +401,10 @@ iot_driver_linux/
 - Key remapping, macro recording, trigger/actuation configuration
 - pcap replay mode for offline protocol analysis
 
+## Related Project
+
+- [webenftool-linux](https://github.com/Juninho-VS/webenftool-linux) — a separate, optional Linux companion daemon (`ws://127.0.0.1:15071`) and standalone audio-reactive lighting utility for Shenzhen Beiying / BYTech (`Report ID 0x09`) keyboards used with the HubX web configurator (`demo.hubx.pro`). It is independent of `iot_driver` and is not required to use `iot_driver`'s native Beiying backend.
+
 ## License
 
 GPL-3.0
